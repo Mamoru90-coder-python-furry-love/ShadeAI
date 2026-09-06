@@ -1,0 +1,27 @@
+<!DOCTYPE html><html><body style="background:#111;color:#0f0;font:13px Consolas""><div id="out">checking…</div>
+<script>
+fetch("index.html",{cache:"no-store"}).then(r=>r.text()).then(html=>{
+  const out=document.getElementById("out");
+  try{
+    const doc=new DOMParser().parseFromString(html,"text/html");
+    const scripts=doc.querySelectorAll("script");
+    out.innerHTML+="script blocks: "+scripts.length+"<br>";
+    let all="";
+    scripts.forEach((s,i)=>{all+="\n/*== block "+i+" ==*/\n"+s.textContent;});
+    try{ new Function(all); out.innerHTML+="<br><span style='color:#3f3'>SYNTAX OK</span>"; }
+    catch(e){
+      out.innerHTML+="<br><span style='color:#f33'>SYNTAX ERR: "+(e.message||e)+"</span>";
+      // locate the line: binary search by feeding prefixes
+      const lines=all.split("\n");
+      let lo=1,hi=lines.length,bad=-1;
+      while(lo<=hi){const mid=(lo+hi)>>1;try{new Function(lines.slice(0,mid).join("\n"));lo=mid+1;}catch(e2){bad=mid;hi=mid-1;}}
+      if(bad>0){
+        out.innerHTML+="<br>first failing line ≈ "+bad+":";
+        for(let k=Math.max(0,bad-3);k<Math.min(lines.length,bad+2);k++){
+          out.innerHTML+="<br>"+(k+1)+": "+lines[k].replace(/</g,"&lt;");
+        }
+      }
+    }
+  }catch(e){out.innerHTML+="ERR "+e.message;}
+});
+</script></body></html>

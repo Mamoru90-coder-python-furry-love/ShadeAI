@@ -1,0 +1,12 @@
+<!DOCTYPE html><html><body style="background:#111;color:#0f0;font:14px Consolas">
+<div id="out">starting...</div>
+<script>
+const out=document.getElementById("out");
+function log(m){out.innerHTML+="<br>"+m;}
+fetch("state.json",{cache:"no-store"}).then(r=>{log("HTTP "+r.status+" type="+r.headers.get("content-type"));return r.text();}).then(t=>{
+  log("text length: "+t.length);
+  log("first 100: "+t.substr(0,100).replace(/</g,"&lt;"));
+  try{const j=JSON.parse(t);log("JSON OK. keys: "+Object.keys(j).length);log("loss="+j.loss+" net.cols="+(j.net?j.net.cols.length:"NO NET")+" net.arcs="+(j.net&&j.net.arcs?j.net.arcs.length:"NO ARCS"));}
+  catch(e){log("JSON ERR: "+e.message);}
+}).catch(e=>log("FETCH ERR: "+e.message));
+</script></body></html>

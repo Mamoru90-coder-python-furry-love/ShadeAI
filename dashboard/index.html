@@ -1,0 +1,1095 @@
+﻿<!DOCTYPE html>
+<html lang="uk">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ShadeAI — під капотом тренування</title>
+<style>
+/* ============ design tokens ============ */
+:root{
+  /* dark */
+  --bg:#0a0f1e; --surface:#111828; --surface2:#171f33; --elev:rgba(10,15,30,.6);
+  --line:#1d2942; --line2:#283755;
+  --txt:#e8eefc; --muted:#8b98b2; --faint:#5b6a87;
+  --acc:#4f7cff; --acc2:#8b5cf6; --green:#38d39f; --red:#ff5c5c;
+  --org:#ffb454; --cyan:#3fd0e6; --pur:#a78bfa;
+  --on-acc:#ffffff;
+  --glow-g:rgba(56,211,159,.5); --glow-a:rgba(79,124,255,.5);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --shadow-md:0 4px 16px -4px rgba(0,0,0,.5);
+  --shadow-lg:0 10px 32px -8px rgba(0,0,0,.55);
+  --radius-s:8px; --radius-m:12px; --radius-l:16px;
+}
+.light{
+  --bg:#f3f5fa; --surface:#ffffff; --surface2:#eef2f9; --elev:rgba(255,255,255,.75);
+  --line:#dfe6f1; --line2:#c6d2e4;
+  --txt:#182236; --muted:#5c6c88; --faint:#8fa0ba;
+  --acc:#3560d8; --acc2:#7c5ce0; --green:#0f9d63; --red:#d84343;
+  --org:#c07a12; --cyan:#0aa1b8; --pur:#7c5ce0;
+  --on-acc:#ffffff;
+  --glow-g:rgba(15,157,99,.35); --glow-a:rgba(53,96,216,.35);
+  --shadow-sm:0 1px 2px rgba(30,50,90,.08);
+  --shadow-md:0 4px 14px -4px rgba(30,50,90,.14);
+  --shadow-lg:0 10px 30px -10px rgba(30,50,90,.18);
+}
+
+/* ============ base ============ */
+*{box-sizing:border-box;margin:0;padding:0}
+html{scrollbar-color:var(--line) var(--bg)}
+body{
+  background:var(--bg);
+  background-image:
+    radial-gradient(900px 420px at 12% -6%,rgba(79,124,255,.10),transparent 60%),
+    radial-gradient(700px 360px at 88% 8%,rgba(139,92,246,.07),transparent 55%);
+  background-attachment:fixed;
+  color:var(--txt);
+  font-family:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
+  font-size:13.5px; line-height:1.5;
+  padding:0 0 48px;
+  min-height:100vh;
+}
+::selection{background:rgba(79,124,255,.3)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--line2)}
+
+/* ============ layout ============ */
+.wrap{max-width:1240px;margin:0 auto;padding:0 20px}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:14px}
+.view{display:none;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:14px}
+.view.active{display:grid}
+.c3{grid-column:span 3}.c4{grid-column:span 4}.c5{grid-column:span 5}
+.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:1/-1}
+@media(max-width:1080px){
+  .c4{grid-column:span 6}.c5,.c7{grid-column:1/-1}.c3{grid-column:span 4}
+}
+@media(max-width:760px){
+  .c3,.c4{grid-column:1/-1}
+}
+
+/* ============ header ============ */
+header{
+  position:sticky;top:0;z-index:30;
+  background:var(--elev);
+  backdrop-filter:blur(16px) saturate(1.4);-webkit-backdrop-filter:blur(16px) saturate(1.4);
+  border-bottom:1px solid var(--line);
+}
+.hd-in{
+  max-width:1240px;margin:0 auto;padding:12px 20px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{
+  width:32px;height:32px;border-radius:9px;flex-shrink:0;
+  background:linear-gradient(135deg,var(--acc),var(--acc2));
+  display:grid;place-items:center;color:#fff;font-weight:800;font-size:16px;
+  box-shadow:0 3px 10px -2px var(--glow-a);
+  letter-spacing:.5px;
+}
+.brand-name{font-size:15px;font-weight:700;letter-spacing:.2px;line-height:1.2}
+.brand-sub{font-size:10.5px;color:var(--muted)}
+.hd-status{display:flex;align-items:center;gap:8px}
+#dot{width:10px;height:10px;border-radius:50%;background:var(--faint);transition:background .25s, box-shadow .25s}
+#dot.on{background:var(--green);box-shadow:0 0 8px var(--glow-g)}
+#dot.on.pulse{animation:pulse 1.2s ease-in-out infinite}
+#dot.idle{background:var(--org);box-shadow:0 0 7px rgba(255,180,84,.5)}
+#dot.off{background:var(--red);box-shadow:0 0 7px rgba(255,92,92,.5)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.status-badge{
+  padding:2.5px 9px;border-radius:999px;
+  font-size:10.5px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+  border:1px solid transparent;
+}
+.status-training{color:var(--green);border-color:rgba(56,211,159,.45);background:rgba(56,211,159,.12);animation:pulse 2s ease-in-out infinite}
+.status-paused{color:var(--org);border-color:rgba(255,180,84,.5);background:rgba(255,180,84,.1)}
+.status-done{color:var(--pur);border-color:rgba(167,139,250,.45);background:rgba(167,139,250,.1)}
+.status-error{color:var(--red);border-color:rgba(255,92,92,.45);background:rgba(255,92,92,.1)}
+.status-idle{color:var(--muted);border-color:var(--line2);background:var(--surface2)}
+.hd-meta{margin-left:auto;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.meta-item{font-size:11px;color:var(--muted);white-space:nowrap}
+.meta-item b{color:var(--txt);font-weight:600;font-variant-numeric:tabular-nums}
+.hd-actions{display:flex;gap:8px;flex-wrap:wrap}
+
+/* ============ buttons / controls ============ */
+button{font-family:inherit}
+.tgl{
+  background:var(--surface2);color:var(--txt);
+  border:1px solid var(--line);border-radius:var(--radius-s);
+  padding:6px 12px;font-size:12px;font-weight:500;cursor:pointer;
+  transition:all .16s ease;display:inline-flex;align-items:center;gap:6px;
+  font-variant-numeric:tabular-nums;
+}
+.tgl:hover{border-color:var(--acc);color:var(--acc);transform:translateY(-1px);box-shadow:var(--shadow-sm)}
+.tgl:active{transform:translateY(0)}
+.tgl.primary{background:linear-gradient(135deg,var(--acc),var(--acc2));border-color:transparent;color:var(--on-acc)}
+.tgl.primary:hover{filter:brightness(1.08);color:var(--on-acc);box-shadow:0 4px 14px -3px var(--glow-a)}
+select{
+  background:var(--surface2);color:var(--txt);
+  border:1px solid var(--line);border-radius:var(--radius-s);padding:6px 10px;
+  font-size:12px;font-family:inherit;cursor:pointer;transition:border-color .15s;
+}
+select:hover{border-color:var(--line2)}
+select:focus{outline:none;border-color:var(--acc)}
+
+/* ============ cards ============ */
+.card{
+  background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--radius-l);
+  padding:18px;min-height:80px;position:relative;
+  transition:border-color .2s,transform .2s,box-shadow .2s;
+}
+.card:hover{border-color:var(--line2);box-shadow:var(--shadow-md)}
+.c-title{
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:1.3px;
+  color:var(--muted);margin-bottom:14px;display:flex;align-items:center;gap:8px;
+}
+.c-title::after{content:'';flex:1;height:1px;background:linear-gradient(90deg,var(--line),transparent);margin-left:4px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:baseline}
+.kv b{
+  font-weight:700;font-size:14px;font-variant-numeric:tabular-nums;
+  font-family:'JetBrains Mono','Cascadia Mono',Consolas,monospace;
+}
+.kv span{color:var(--muted);font-size:11.5px}
+.hint{color:var(--muted);font-size:11px;margin-top:8px}
+
+/* ============ hero card (loss) ============ */
+.hero{
+  background:linear-gradient(180deg,color-mix(in srgb,var(--acc) 4%,var(--surface)),var(--surface));
+  border-color:color-mix(in srgb,var(--acc) 22%,var(--line));
+}
+.hero-kpis{display:flex;gap:0;flex-wrap:wrap;margin-bottom:14px}
+.kpi{padding:2px 26px 2px 0;margin-right:26px;border-right:1px solid var(--line)}
+.kpi:last-child{border-right:none}
+@media(max-width:640px){.kpi{border-right:none;margin:0 24px 8px 0}}
+.kpi-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:5px}
+.kpi-val{font-size:30px;font-weight:800;line-height:1;letter-spacing:-.5px;font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',Consolas,monospace}
+.kpi-val small{font-size:14px;font-weight:700;margin-right:4px;color:var(--muted)}
+.kpi.loss .kpi-val{color:var(--acc)}
+.kpi.ema .kpi-val{color:var(--green)}
+.kpi.min .kpi-val{color:var(--cyan)}
+.kpi.desc{margin-top:4px;font-size:11px;color:var(--faint)}
+.hero-sub{display:flex;gap:24px;flex-wrap:wrap;margin-bottom:4px}
+.hero-sub b{font-size:13px;font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',Consolas,monospace;font-weight:600}
+.hero-sub span{color:var(--muted);font-size:11px}
+.epbar{margin-top:14px;margin-bottom:2px}
+.epbar-head{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:6px;color:var(--muted)}
+.epbar-head b{color:var(--txt);font-size:15px;font-family:'JetBrains Mono',Consolas,monospace}
+#ep_pct{font-weight:700;color:var(--acc);font-size:12px}
+.epbar-track{height:10px;border-radius:99px;background:var(--surface2);overflow:hidden;box-shadow:inset 0 1px 3px rgba(0,0,0,.35)}
+.epbar-fill{height:100%;width:0%;border-radius:99px;background:linear-gradient(90deg,var(--acc),var(--green));transition:width .5s ease}
+.epbar-sub{margin-top:6px;font-size:11.5px;color:var(--muted)}
+
+/* ============ chart ============ */
+.chart-box{position:relative;margin-top:4px}
+.chart-box canvas{
+  width:100%;height:auto;display:block;border-radius:var(--radius-m);
+  border:1px solid var(--line);
+}
+.chart-legend{
+  display:flex;gap:14px;margin-top:10px;align-items:center;flex-wrap:wrap;
+}
+.chart-legend .lg{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+.chart-legend .sw{width:14px;height:3px;border-radius:2px}
+
+/* ============ token chips ============ */
+.toks{display:flex;flex-wrap:wrap;gap:4px}
+.chip{
+  display:inline-flex;align-items:center;gap:2px;
+  padding:3px 7px;border-radius:6px;background:var(--surface2);
+  border:1px solid var(--line);font-size:11.5px;font-family:'JetBrains Mono',Consolas,monospace;
+  cursor:default;transition:border-color .15s,transform .15s;
+  font-variant-numeric:tabular-nums;
+}
+.chip:hover{border-color:var(--acc);transform:translateY(-1px)}
+.chip.target{border-color:var(--green);box-shadow:0 0 0 1px var(--green) inset;color:var(--green);background:color-mix(in srgb,var(--green) 10%,var(--surface2))}
+
+/* ============ top-k bars ============ */
+.bar{display:flex;align-items:center;gap:10px;margin:5px 0;cursor:pointer}
+.bar:hover .bname{color:var(--acc)}
+.bname{width:108px;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:color .15s}
+.btrack{flex:1;height:9px;background:var(--surface2);border-radius:5px;overflow:hidden}
+.bfill{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:5px;transition:width .35s cubic-bezier(.4,0,.2,1)}
+.bprob{width:50px;text-align:right;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',Consolas,monospace}
+
+/* ============ full context ============ */
+pre.txt{
+  white-space:pre-wrap;word-break:break-word;background:var(--surface2);
+  border:1px solid var(--line);border-radius:var(--radius-m);padding:12px 14px;
+  font-size:12px;line-height:1.6;max-height:180px;overflow:auto;
+  font-family:'JetBrains Mono','Cascadia Mono',Consolas,monospace;
+  color:var(--txt);
+}
+
+/* ============ brain card ============ */
+#knowcard{border-color:color-mix(in srgb,var(--org) 24%,var(--line))}
+#knowcard .c-title{color:var(--org)}
+.tabs{display:flex;gap:4px;background:var(--surface2);padding:4px;border-radius:10px;width:fit-content;margin-bottom:16px}
+.tab{
+  background:transparent;border:none;color:var(--muted);border-radius:7px;
+  padding:6px 14px;font-size:12px;font-weight:500;cursor:pointer;transition:all .18s;
+}
+.tab:hover{color:var(--txt)}
+.tab.active{background:var(--surface);color:var(--txt);box-shadow:var(--shadow-sm);font-weight:600}
+.langrow{display:flex;align-items:center;gap:10px;margin:8px 0}
+.langrow .lc{width:100px;font-size:12px;flex-shrink:0}
+.langrow .lt{flex:1;height:10px;background:var(--surface2);border-radius:5px;overflow:hidden}
+.langrow .lf{height:100%;background:linear-gradient(90deg,var(--org),var(--green));border-radius:5px;transition:width .6s cubic-bezier(.4,0,.2,1)}
+.langrow .lp{width:44px;text-align:right;font-size:11px;color:var(--muted)}
+.langrow .ls{width:110px;font-size:10.5px;color:var(--faint);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.road{display:flex;align-items:center;gap:10px;padding:8px 12px;margin:5px 0;background:var(--surface2);border-radius:10px;border-left:3px solid var(--line2);transition:transform .15s,box-shadow .15s}
+.road:hover{transform:translateX(3px);box-shadow:var(--shadow-sm)}
+.road.proc{border-left-color:var(--org)}
+.road.done{border-left-color:var(--green)}
+.road .ic{font-size:16px;width:24px;text-align:center;flex-shrink:0}
+.road .nm{font-weight:600;font-size:12.5px}
+.road .ds{color:var(--muted);font-size:11.5px}
+.road .st{margin-left:auto;font-size:10.5px;color:var(--faint);white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
+
+
+
+/* ============ events ============ */
+#events{max-height:216px;overflow:auto;font-size:11.5px;line-height:1.6}
+#events div{padding:3px 8px;border-left:3px solid var(--line);border-radius:0 6px 6px 0}
+#events div:hover{background:var(--surface2)}
+#events div b{color:var(--acc);font-weight:600;font-variant-numeric:tabular-nums}
+#events div.ckpt{border-left-color:var(--pur)}
+#events div.gen{border-left-color:var(--org)}
+#events div.epoch{border-left-color:var(--green)}
+#events input{
+  width:100%;margin-bottom:8px;padding:6px 10px;background:var(--surface2);
+  border:1px solid var(--line);border-radius:var(--radius-s);color:var(--txt);
+  font-size:11.5px;font-family:inherit;transition:border-color .15s;
+}
+#events input:focus{outline:none;border-color:var(--acc)}
+#events input::placeholder{color:var(--faint)}
+
+/* ============ header tabs ============ */
+.hd-tabs{
+  display:flex;gap:4px;margin-top:10px;padding-top:10px;
+  border-top:1px solid var(--line);flex-wrap:wrap;
+}
+.hd-tab{
+  background:transparent;border:1px solid transparent;color:var(--muted);
+  border-radius:var(--radius-s);padding:8px 16px;font-size:12.5px;font-weight:600;
+  cursor:pointer;transition:all .16s;font-family:inherit;display:inline-flex;align-items:center;gap:7px;
+}
+.hd-tab:hover{color:var(--txt);background:var(--surface2)}
+.hd-tab.active{color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,var(--surface2));border-color:color-mix(in srgb,var(--acc) 30%,transparent)}
+.hd-tab .ic{font-size:14px;line-height:1}
+@keyframes fadein{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+/* ============ misc ============ */
+#snap{
+  display:none;margin-top:14px;padding:10px 14px;border-radius:var(--radius-m);
+  background:color-mix(in srgb,var(--org) 9%,var(--surface));
+  border:1px solid color-mix(in srgb,var(--org) 40%,transparent);
+  color:var(--org);font-size:12px;
+}
+footer{margin-top:22px;color:var(--faint);font-size:11px;padding:0 20px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.tooltip{position:relative;cursor:help}
+.tooltip::after{
+  content:attr(data-tip);position:absolute;bottom:calc(100% + 6px);left:50%;
+  transform:translateX(-50%);background:#0a0f1e;color:#e8eefc;padding:5px 9px;
+  border-radius:6px;font-size:10.5px;white-space:nowrap;z-index:50;
+  border:1px solid #283755;box-shadow:0 4px 14px rgba(0,0,0,.5);
+  opacity:0;pointer-events:none;transition:opacity .15s;
+}
+.light .tooltip::after{background:#fff;color:#182236;border-color:#c6d2e4}
+.tooltip:hover::after{opacity:1}
+
+.compact-mode .card{padding:10px}
+.compact-mode .grid{gap:8px}
+.compact-mode .c-title{margin-bottom:8px;font-size:10px}
+.compact-mode .kv{gap:4px 10px}
+.compact-mode .kv b{font-size:12px}
+.compact-mode .kv span{font-size:10.5px}
+.compact-mode .kpi-val{font-size:22px}
+.compact-mode .chart-box canvas{border-radius:8px}
+.compact-mode #events{max-height:140px}
+</style>
+</head>
+<body>
+<header>
+  <div class="hd-in">
+    <div class="brand">
+      <div class="logo">S</div>
+      <div>
+        <div class="brand-name">ShadeAI</div>
+        <div class="brand-sub">під капотом тренування</div>
+      </div>
+    </div>
+    <div class="hd-status">
+      <div id="dot" class="off"></div>
+      <span class="status-badge status-idle" id="statusBadge">idle</span>
+    </div>
+    <div class="hd-meta">
+      <span class="meta-item">оновлено <b id="refr">—</b></span>
+      <span class="meta-item">аптайм <b id="upt">—</b></span>
+      <div class="hd-actions">
+        <button class="tgl" id="btnPause">⏸ пауза</button>
+        <select id="themeSel">
+          <option value="dark">темна</option>
+          <option value="light">світла</option>
+          <option value="auto">авто</option>
+        </select>
+        <button class="tgl" id="btnExportJson" title="експорт стану (JSON)">💾 JSON</button>
+        <button class="tgl" id="btnExportCsv" title="експорт loss (CSV)">📊 CSV</button>
+        <input type="file" id="fileImport" accept=".json" style="display:none">
+        <button class="tgl" id="btnImportJson" title="імпорт стану (JSON)">📥 імпорт</button>
+      </div>
+    </div>
+  </div>
+  <nav class="hd-tabs">
+    <button class="hd-tab active" data-view="view-overview"><span class="ic">📊</span>Огляд</button>
+    <button class="hd-tab" data-view="view-progress"><span class="ic">🏃</span>Тренування</button>
+    <button class="hd-tab" data-view="view-model"><span class="ic">🧬</span>Модель</button>
+    <button class="hd-tab" data-view="view-data"><span class="ic">📄</span>Дані</button>
+    <button class="hd-tab" data-view="view-brain"><span class="ic">🧠</span>Мозок</button>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div id="snap">Це знімок останнього запуску (<b>shade serve</b>). Живий дашборд з'явиться після <b>--dashboard</b></div>
+
+  <!-- ===== VIEW: OVERVIEW ===== -->
+  <div class="view active" id="view-overview">
+    <section class="card hero c12">
+      <div class="c-title">Loss</div>
+      <div class="hero-kpis">
+        <div class="kpi loss">
+          <div class="kpi-label">loss</div>
+          <div class="kpi-val" id="loss">—</div>
+          <div class="kpi desc">поточне значення</div>
+        </div>
+        <div class="kpi ema">
+          <div class="kpi-label">ema · згладжене</div>
+          <div class="kpi-val" id="lossEma">—</div>
+          <div class="kpi desc">тренд без шуму</div>
+        </div>
+        <div class="kpi min">
+          <div class="kpi-label">мінімум</div>
+          <div class="kpi-val" id="lossMin">—</div>
+          <div class="kpi desc">найкраще досягнуте</div>
+        </div>
+      </div>
+      <div class="hero-sub">
+        <span>крок <b id="lossStep">—</b></span>
+        <span>ppl <b id="perplexity">—</b></span>
+        <span>ppl (ema) <b id="ppl_ema">—</b></span>
+        <span>lr <b id="t_lr">—</b></span>
+      </div>
+      <div class="epbar">
+        <div class="epbar-head">
+          <span>епоха <b id="d_epoch">—</b></span>
+          <span id="ep_pct">0%</span>
+        </div>
+        <div class="epbar-track"><div class="epbar-fill" id="ep_fill"></div></div>
+        <div class="epbar-sub"><span id="ep_it">—</span> · <span id="ep_left">—</span></div>
+      </div>
+      <div class="chart-box">
+        <canvas id="lossplt" width="1000" height="230"></canvas>
+      </div>
+      <div class="chart-legend">
+        <span class="lg"><span class="sw" style="background:#4f7cff"></span>loss</span>
+        <span class="lg"><span class="sw" style="background:#38d39f"></span>ema</span>
+        <span class="lg" style="margin-left:auto">наведи на графік</span>
+        <button class="tgl" id="lossFullscreen" title="повний екран">⛶</button>
+        <button class="tgl" id="lossExportPng" title="експорт PNG">PNG</button>
+      </div>
+    </section>
+
+    <section class="card c7"><div class="c-title">Контекст</div>
+      <div class="hint" style="margin-top:0;margin-bottom:10px">зелена рамка = наступний токен · клік — копіює</div>
+      <div class="toks" id="toks">—</div>
+    </section>
+
+    <section class="card c5"><div class="c-title">Підсумок</div>
+      <div class="kv">
+        <b id="pd_step">—</b><span>загальних кроків</span>
+        <b id="pd_tok">—</b><span>токенів оброблено ×10⁶</span>
+        <b id="pd_pers">—</b><span class="tooltip" data-tip="швидкість токенів/с">ток/с</span>
+        <b id="pd_elap">—</b><span>час від старту</span>
+      </div>
+      <div class="kv" style="margin-top:10px;border-top:1px solid var(--stroke);padding-top:10px">
+        <b id="val_loss">—</b><span>train loss</span>
+        <b id="best_loss_v" style="color:var(--green,#4a4)">—</b><span class="tooltip" data-tip="найкращий val / train loss">best val</span>
+        <b id="val_gap">—</b><span>val − train</span>
+        <b id="best_epoch">—</b><span class="tooltip" data-tip="де досягнуто найкращого val">best епоха</span>
+        <b id="val_bad">—</b><span>стан</span>
+      </div>
+    </section>
+
+    <section class="card c12"><div class="c-title">Повний контекст</div>
+      <pre class="txt" id="wtxt">—</pre>
+    </section>
+  </div>
+
+  <!-- ===== VIEW: PROGRESS ===== -->
+  <div class="view" id="view-progress">
+    <section class="card c12"><div class="c-title">Прогрес тренування</div>
+      <div class="hero-kpis" style="margin-bottom:6px;justify-content:space-between">
+        <div class="kpi">
+          <div class="kpi-label">загальних кроків</div>
+          <div class="kpi-val" style="font-size:24px" id="pd_step2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">токенів оброблено ×10⁶</div>
+          <div class="kpi-val" style="font-size:24px" id="pd_tok2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">ток/с</div>
+          <div class="kpi-val" style="font-size:24px" id="pd_pers2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">час від старту</div>
+          <div class="kpi-val" style="font-size:24px" id="pd_elap2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label" style="color:var(--green,#4a4)">val loss</div>
+          <div class="kpi-val" style="font-size:24px" id="val_loss2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">train loss</div>
+          <div class="kpi-val" style="font-size:24px" id="pd_loss2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">best (val)</div>
+          <div class="kpi-val" style="font-size:24px" id="best_loss_v2">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">стан</div>
+          <div id="val_bad2" class="kpi-val" style="font-size:18px">—</div>
+        </div>
+      </div>
+      <div class="epbar" style="margin-top:20px">
+        <div class="epbar-head">
+          <span>епоха <b id="d_epoch2">—</b></span>
+          <span id="ep_pct2">0%</span>
+        </div>
+        <div class="epbar-track"><div class="epbar-fill" id="ep_fill2"></div></div>
+        <div class="epbar-sub"><span id="ep_it2">—</span> · <span id="ep_left2">—</span></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===== VIEW: MODEL ===== -->
+  <div class="view" id="view-model">
+    <section class="card c12"><div class="c-title">🧬 Модель</div>
+      <div class="kv" style="grid-template-columns:repeat(3,auto 1fr);gap:14px 18px">
+        <b id="m_layers">—</b><span>блоків</span>
+        <b id="m_dim">—</b><span>dim</span>
+        <b id="m_vocab">—</b><span>словник</span>
+        <b id="m_ctx">—</b><span>контекст</span>
+        <b id="m_param">—</b><span>параметрів</span>
+        <b id="m_trainable">—</b><span>тренованих параметрів</span>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===== VIEW: DATA ===== -->
+  <div class="view" id="view-data">
+    <section class="card c12"><div class="c-title">📄 Дані</div>
+      <div class="kv" style="grid-template-columns:repeat(3,auto 1fr);gap:14px 18px">
+        <b id="t_file">—</b><span>файл датасета</span>
+        <b id="t_tokens">—</b><span>токенів у файлі</span>
+        <b id="t_epoch">—</b><span>епох заплановано</span>
+        <b id="t_window">—</b><span>вікно контексту</span>
+        <b id="t_lr2">—</b><span>крок навчання (lr)</span>
+        <b id="t_tot">—</b><span>токенів епохи</span>
+      </div>
+      <div class="hint" style="margin-top:12px">кожен записаний байт корпусу = один токен послідовності навчання</div>
+    </section>
+  </div>
+
+  <!-- ===== VIEW: BRAIN ===== -->
+  <div class="view" id="view-brain">
+    <section class="card c12"><div class="c-title">🧠 Мозок ShadeAI</div>
+      <div class="tabs">
+        <button class="tab active" data-tab="tab-know">Знання</button>
+        <button class="tab" data-tab="tab-plans">Плани</button>
+        <button class="tab" data-tab="tab-fc">Прогноз</button>
+      </div>
+      <div id="tab-know" style="margin-top:10px">
+        <div id="langrates"><span style="color:var(--faint)">чекаємо перший loss…</span></div>
+        <div class="hint">оцінка розуміння української по поточному loss</div>
+      </div>
+      <div id="tab-plans" style="display:none;margin-top:10px"><div id="roadmap"></div></div>
+      <div id="tab-fc" style="display:none;margin-top:10px">
+        <div class="kv" style="grid-template-columns:auto 1fr">
+          <b id="f_done">—</b><span>токенів пройдено</span>
+          <b id="f_target">—</b><span>ціль (20 ток./параметр)</span>
+          <b id="f_pct">—</b><span>прогрес до цілі</span>
+          <b id="f_eta">—</b><span>залишок часу</span>
+          <b id="f_epoch">—</b><span>повна епоха</span>
+        </div>
+        <div class="hint">розрахунок від поточних цифр</div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<footer>
+  <span>ShadeAI dashboard</span>
+</footer>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b) => v<a?a:(v>b?b:v);
+function fmt(b){
+  if(b==null||!isFinite(b))return'—';
+  const n=typeof b==='string'?(+b):b;
+  if(!isFinite(n))return'—';
+  if(Math.abs(n)>=1e6)return(n/1e6).toFixed(2)+'M';
+  if(Math.abs(n)>=1e3)return(n/1e3).toFixed(1)+'k';
+  return (Math.abs(n)>=100? Math.round(n) : (+n.toFixed(2)))+'';
+}
+function fmtT(sec){
+  if(sec==null||!isFinite(sec))return'—';
+  sec=Math.floor(Math.max(0,sec));
+  const d=Math.floor(sec/86400), h=Math.floor((sec%86400)/3600),
+        m=Math.floor((sec%3600)/60), s=sec%60;
+  const p=x=>x<10?'0'+x:''+x;
+  return d>0? d+'д '+h+'г ' : h>0? h+'г '+p(m)+'м' : p(m)+':'+p(s);
+}
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function copyTxt(t){ try{ navigator.clipboard.writeText(t); }catch(_){} }
+
+/* ===== state ===== */
+let S=null;
+
+/* ===== live ===== */
+function tick(){
+  fetch('state.json').then(r=>r.json()).then(d=>{ apply(d); }).catch(()=>{});
+}
+
+/* ===== theme aware palette (canvas) ===== */
+function cvPal(){
+  const light=document.documentElement.classList.contains('light');
+  return light
+    ? {bg:'#ffffff',grid:'#eef1f7',loss:'#3560d8',ema:'#0f9d63',txt:'#8fa0ba',fillA:'rgba(53,96,216,.08)',fillE:'rgba(15,157,99,.10)'}
+    : {bg:'#0d1322',grid:'#1d2942',loss:'#5b98ff',ema:'#3ddc9a',txt:'#5b6a87',fillA:'rgba(79,124,255,.09)',fillE:'rgba(56,211,159,.11)'};
+}
+
+/* ===== apply ===== */
+let lastIters=-1, lastLen=-1;
+function apply(d){
+  const prev=S;
+  S=d;
+  $('refr').textContent=new Date().toLocaleTimeString('uk-UA');
+  const up=d.uptime || d.upd || 0;
+  $('upt').textContent = (typeof up==='number'&&up>0)? fmtT(up) : '—';
+  setStatus(d.status||'idle');
+  if(d.status==='finished'){ $('snap').style.display='block'; }
+  else{ $('snap').style.display='none'; }
+  ui();
+  const iters=d.total_iters||0;
+  const len=(d.loss_h||[]).length;
+  const eChanged = d.epoch!==(prev&&prev.epoch);
+  const changed = iters!==lastIters || len!==lastLen || eChanged;
+  lastIters=iters; lastLen=len;
+  if(changed){ renderLoss(); renderToks(); renderWtxt(); renderPerplexity(); drawLang(); drawRoadmap(); drawFc(); }
+}
+function setStatus(st){
+  const dot=$('dot'), bad=$('statusBadge');
+  dot.className='';
+  bad.className='status-badge status-idle';
+  bad.textContent=st;
+  const map={training:['on','pulse','status-training'],paused:['on','','status-paused'],finished:['on','','status-done'],error:['off','','status-error'],idle:['idle','','status-idle']};
+  const m=map[st]||map['idle'];
+  dot.classList.add(m[0]);
+  if(m[1]) dot.classList.add(m[1]);
+  bad.classList.remove('status-idle'); bad.classList.add(m[2]);
+}
+
+/* ===== ui ===== */
+function ui(){
+  if(!S) return;
+  const d=S;
+  const tok = (d.total_iters||0) * (d.ctx||1);
+  $('pd_tok').textContent = (tok/1e6).toFixed(1);
+  $('pd_pers').textContent = fmt(d.tokens_per_sec);
+  $('pd_elap').textContent = fmtT(d.upd||d.uptime||0);
+  $('pd_step').textContent = fmt(d.total_iters);
+  $('d_epoch').textContent = d.epoch!=null&&d.epochs_total!=null ? d.epoch+'/'+d.epochs_total : '-';
+  if($('pd_tok2')){ $('pd_tok2').textContent=$('pd_tok').textContent; $('pd_pers2').textContent=$('pd_pers').textContent; $('pd_elap2').textContent=$('pd_elap').textContent; $('pd_step2').textContent=$('pd_step').textContent; $('d_epoch2').textContent=$('d_epoch').textContent; }
+  updateEpochBar(d);
+  $('m_layers').textContent = fmt(d.blocks);
+  $('m_dim').textContent = fmt(d.dim);
+  $('m_vocab').textContent = fmt(d.vocab);
+  $('m_ctx').textContent = fmt(d.ctx);
+  $('m_param').textContent = fmt(d.params);
+  if($('m_trainable')) $('m_trainable').textContent = fmt(d.trainable_params!=null?d.trainable_params:d.params);
+  $('t_lr').textContent = d.lr!=null? (+d.lr).toPrecision(3) : '—';
+  $('t_file').textContent = (d.data_file||'').replace(/^[.\\/]+/,'') || '—';
+  $('t_tokens').textContent = fmt(d.data_tokens);
+  if($('t_epoch')) $('t_epoch').textContent = d.epochs_total!=null? d.epochs_total : '—';
+  if($('t_window')) $('t_window').textContent = fmt(d.window||d.ctx);
+  if($('t_lr2')) $('t_lr2').textContent = d.lr!=null? (+d.lr).toPrecision(3) : '—';
+  if($('t_tot')) $('t_tot').textContent = fmt(d.data_tokens);
+  if(d.loss!=null) $('loss').textContent = d.loss.toFixed(3);
+  if(d.loss_ema!=null) $('lossEma').textContent = d.loss_ema.toFixed(3);
+  if(d.loss!=null) $('lossStep').textContent = fmt(d.total_iters);
+  if(d.global_min_loss!=null){ $('lossMin').textContent = (+d.global_min_loss).toFixed(3); }
+  else if(d.loss_h && d.loss_h.length){
+    let mn=1e18;
+    for(let i=0;i<d.loss_h.length;i++){ const v=d.loss_h[i]; if(v!=null&&v<mn)mn=v; }
+    $('lossMin').textContent = mn<1e18? mn.toFixed(3):'—';
+  }
+  if($('val_loss')) $('val_loss').textContent = d.val_loss!=null? (+d.val_loss).toFixed(3) : (d.loss!=null? (+d.loss).toFixed(3):'—');
+  if($('val_loss2')) $('val_loss2').textContent = d.val_loss!=null? (+d.val_loss).toFixed(3) : (d.loss!=null? (+d.loss).toFixed(3):'—');
+  if($('pd_loss2')) $('pd_loss2').textContent = d.loss!=null? (+d.loss).toFixed(3) : '—';
+  if($('best_loss_v2')) $('best_loss_v2').textContent = d.best_loss!=null? (+d.best_loss).toFixed(3) : (d.loss_h&&d.loss_h.length? '…':'—');
+  if(d.val_loss!=null&&d.loss!=null){
+    const v=$('val_gap'); if(v){ const gap=(+d.val_loss)-(+d.loss); v.textContent=(gap>0?'+':'')+gap.toFixed(3); }
+    const e=$('val_bad'); if(e){ e.textContent = (d.val_loss-d.loss)>3 ? 'розбіжність (overfit?)' : 'ок';
+      e.style.color = (d.val_loss-d.loss)>3 ? 'var(--red,#d44)' : 'var(--green,#4a4)'; }
+    const e2=$('val_bad2'); if(e2){ e2.textContent = (d.val_loss-d.loss)>3 ? '⚠ розбіжність' : 'ок';
+      e2.style.color = (d.val_loss-d.loss)>3 ? 'var(--red,#d44)' : 'var(--green,#4a4)'; }
+  } else if($('val_bad2')){ $('val_bad2').textContent='—'; }
+  if($('best_epoch')) $('best_epoch').textContent = d.best_epoch!=null? ('епоха '+fmt(d.best_epoch)) : '—';
+  if($('best_epoch2')) $('best_epoch2').textContent = d.best_epoch!=null? ('епоха '+fmt(d.best_epoch)) : '—';
+  if($('best_loss_v')) $('best_loss_v').textContent = d.best_loss!=null? (+d.best_loss).toFixed(3) : (d.global_min_loss!=null? (+d.global_min_loss).toFixed(3):'—');
+}
+
+/* ===== epoch progress bar ===== */
+function updateEpochBar(d){
+  const fill=$('ep_fill');
+  if(d.epoch==null||d.epochs_total==null){ fill.style.width='0%'; $('ep_pct').textContent='—'; $('ep_it').textContent='—'; $('ep_left').textContent='—';
+    if($('ep_fill2')){ $('ep_pct2').textContent='—'; $('ep_it2').textContent='—'; $('ep_left2').textContent='—'; }
+    return; }
+  const it=(d.epoch_iters!=null&&d.epoch_iters_total&&d.epoch_iters_total>0)?
+    (d.epoch_iters/d.epoch_iters_total)*100:0;
+  const overall=((d.epoch-1)+(it/100))/d.epochs_total*100;
+  const pct=d.epoch_iters!=null?it:overall;
+  fill.style.width=Math.max(0,Math.min(100,pct))+'%';
+  $('ep_pct').textContent=pct.toFixed(1)+'%';
+  $('ep_it').textContent='епоха '+(d.epoch_iters!=null?fmt(d.epoch_iters):'—')+' / '+(d.epoch_iters_total!=null?fmt(d.epoch_iters_total):'—')+' кроків';
+  const left=d.epochs_total-Math.floor(d.epoch);
+  $('ep_left').textContent=left>0?('залишилось '+left+' епох'):'остання епоха';
+  if($('ep_fill2')){
+    $('ep_fill2').style.width=fill.style.width;
+    $('ep_pct2').textContent=$('ep_pct').textContent;
+    $('ep_it2').textContent=$('ep_it').textContent;
+    $('ep_left2').textContent=$('ep_left').textContent;
+  }
+}
+
+/* ===== loss chart ===== */
+function renderLoss(){
+  if(!S) return;
+  const cv=$('lossplt'), ctx=cv.getContext('2d');
+  const W=cv.width, H=cv.height;
+  const pal=cvPal();
+  ctx.clearRect(0,0,W,H);
+  // background
+  ctx.fillStyle=pal.bg; ctx.fillRect(0,0,W,H);
+  const h=S.loss_h||[];
+  if(!h.length){
+    ctx.fillStyle=pal.txt; ctx.font='11px system-ui'; ctx.textAlign='center';
+    ctx.fillText('очікуємо дані…', W/2, H/2);
+    ctx.textAlign='left';
+    return;
+  }
+  const ema=S.loss_ema_h||[];
+  const padL=46, padR=14, padT=14, padB=22;
+  const n=h.length;
+  // visible window: last 600 points, downsample to fit
+  const from=Math.max(0,n-600);
+  const to=n;
+  // downsample
+  const step=Math.ceil((to-from)/1000);
+  const xh=[], xe=[];
+  for(let i=from;i<to;i+=step){ xh.push(i); }
+  if(xh[xh.length-1]!==to-1) xh.push(to-1);
+  const X=i=> padL+(i-from)/(to-from||1)*(W-padL-padR);
+  // y-range
+  let vmin=1e18, vmax=-1e18;
+  const scan=(arr,idxs)=>{ for(const i of idxs){ const v=arr[i]; if(v==null)continue; if(v<vmin)vmin=v; if(v>vmax)vmax=v; } };
+  scan(h,xh);
+  if(ema.length) scan(ema,xh);
+  if(!isFinite(vmin)){ vmin=0; vmax=1; }
+  const span=(vmax-vmin)||1;
+  const lo=vmin-span*0.1, hi=vmax+span*0.1;
+  const Y=v=> padT+(H-padT-padB)*(1-(v-lo)/(hi-lo));
+  // grid (4 lines) + y labels
+  ctx.font='9px system-ui';
+  for(let g=0;g<=4;g++){
+    const gy=padT+(H-padT-padB)*g/4;
+    ctx.strokeStyle=pal.grid; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(padL,gy); ctx.lineTo(W-padR,gy); ctx.stroke();
+    const v=hi-(hi-lo)*g/4;
+    ctx.fillStyle=pal.txt; ctx.textAlign='right';
+    ctx.fillText(v.toFixed(2), padL-8, gy+3);
+  }
+  ctx.textAlign='left';
+  // x ticks (iterate labels)
+  const xTicks=4;
+  ctx.fillStyle=pal.txt;
+  for(let g=0;g<=xTicks;g++){
+    const i=from+Math.round((to-from)*g/xTicks);
+    const it=(S.iters_h&&S.iters_h[i]!=null)?S.iters_h[i]:i;
+    ctx.textAlign='center';
+    ctx.fillText('крок '+fmt(it), X(i), H-7);
+  }
+  ctx.textAlign='left';
+  // epoch markers
+  const it_h=S.iters_h||[];
+  if(it_h.length && (S.epoch_marks||[]).length){
+    ctx.strokeStyle='rgba(255,180,84,.3)'; ctx.setLineDash([3,5]); ctx.lineWidth=1;
+    ctx.beginPath();
+    (S.epoch_marks||[]).forEach(mIt=>{
+      let bi=-1, bd=1e18;
+      for(let i=from;i<to;i++){
+        const d=Math.abs((it_h[i]!=null?it_h[i]:i)-mIt);
+        if(d<bd){ bd=d; bi=i; }
+      }
+      if(bi>=0){ const x=X(bi); ctx.moveTo(x,padT); ctx.lineTo(x,H-padB); }
+    });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  // EMA area fill
+  if(ema.length && xe.length>1){
+    const xe2=[]; for(let i=from;i<to;i+=step) xe2.push(i);
+    const af=ctx.createLinearGradient(0,0,0,H);
+    af.addColorStop(0,pal.fillE); af.addColorStop(1,'rgba(56,211,159,0)');
+    ctx.fillStyle=af; ctx.beginPath();
+    ctx.moveTo(X(from),Y(ema[from]));
+    for(const i of xe2){ if(i>=ema.length)break; ctx.lineTo(X(i),Y(ema[i])); }
+    if(ema[to-1]!=null) ctx.lineTo(X(to-1),Y(ema[to-1]));
+    ctx.lineTo(X(to-1),H-padB);
+    ctx.lineTo(X(from),H-padB); ctx.closePath(); ctx.fill();
+  }
+  // loss line
+  ctx.strokeStyle=pal.loss; ctx.lineWidth=1.5; ctx.lineJoin='round';
+  ctx.beginPath();
+  for(const i of xh){
+    if(i>=h.length) break;
+    const x=X(i), y=Y(h[i]);
+    if(i===xh[0]||i===from) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  // ema line
+  if(ema.length){
+    ctx.strokeStyle=pal.ema; ctx.lineWidth=2.2; ctx.lineJoin='round';
+    ctx.beginPath();
+    const xe2=[]; for(let i=from;i<to;i+=step) xe2.push(i); xe2.push(to-1);
+    for(const i of xe2){
+      if(i>=ema.length) break;
+      const x=X(i), y=Y(ema[i]);
+      if(i===xe2[0]) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+    // glow dot at last
+    if(ema[to-1]!=null){
+      const lx=X(to-1), ly=Y(ema[to-1]);
+      ctx.beginPath(); ctx.arc(lx,ly,5,0,2*Math.PI);
+      ctx.fillStyle=pal.ema; ctx.globalAlpha=.25; ctx.fill(); ctx.globalAlpha=1;
+      ctx.beginPath(); ctx.arc(lx,ly,3,0,2*Math.PI);
+      ctx.fillStyle=pal.ema; ctx.fill();
+      ctx.strokeStyle=pal.bg; ctx.lineWidth=2; ctx.stroke();
+    }
+  }
+  // current value tag
+  if(h[to-1]!=null){
+    const lastX=X(to-1), lastY=Y(h[to-1]);
+    ctx.font='bold 10px system-ui'; ctx.textAlign='right';
+    const tag='loss '+h[to-1].toFixed(3);
+    ctx.fillStyle=pal.loss; ctx.fillText(tag, lastX-10, Math.min(lastY, H-padB-4)-6);
+    ctx.textAlign='left';
+  }
+}
+
+/* ===== loss hover tooltip ===== */
+function initLoss(){
+  const cv=$('lossplt');
+  const tip=document.createElement('div');
+  tip.style.cssText='position:fixed;pointer-events:none;background:#0a0f1e;color:#e8eefc;border:1px solid #283755;border-radius:8px;padding:6px 10px;font-size:11px;display:none;z-index:60;white-space:nowrap;box-shadow:0 6px 18px rgba(0,0,0,.5);font-family:Consolas,monospace';
+  document.body.appendChild(tip);
+  let raf=0;
+  cv.addEventListener('mousemove',ev=>{
+    if(!S||!S.loss_h||!S.loss_h.length){ tip.style.display='none'; return; }
+    if(raf) cancelAnimationFrame(raf);
+    raf=requestAnimationFrame(()=>{
+      const rect=cv.getBoundingClientRect();
+      const px=(ev.clientX-rect.left)*(cv.width/rect.width);
+      const h=S.loss_h, it_h=S.iters_h||[];
+      const from=Math.max(0,h.length-600);
+      const W=cv.width, padL=46, padR=14;
+      const to=h.length;
+      if(px<padL||px>W-padR){ tip.style.display='none'; return; }
+      const n=to-from;
+      const i=Math.min(to-1, from+Math.round((px-padL)/(W-padL-padR)*n));
+      const it=it_h[i]!=null?it_h[i]:i;
+      const ep=S.epoch_marks?S.epoch_marks.filter(m=>m<=it).length:S.epoch;
+      const ema=S.loss_ema_h||[];
+      tip.style.display='block';
+      tip.style.left=Math.min(ev.clientX+14, window.innerWidth-180)+'px';
+      tip.style.top=(ev.clientY+14)+'px';
+      tip.textContent='loss='+h[i].toFixed(4)+(ema[i]!=null?' · ema='+ema[i].toFixed(4):'')+' · крок='+fmt(it)+' · епоха='+ep;
+    });
+  });
+  cv.addEventListener('mouseleave',()=>{ tip.style.display='none'; });
+}
+
+/* ===== token chips ===== */
+function renderToks(){
+  if(!S) return;
+  const box=$('toks');
+  const toks=S.cur_tokens||[];
+  if(!toks.length){ box.innerHTML='<span style="color:var(--faint)">—</span>'; return; }
+  box.innerHTML='';
+  const mk=(txt,tgt)=>{
+    const el=document.createElement('span');
+    el.className='chip'+(tgt?' target':'');
+    el.textContent=txt;
+    el.addEventListener('click',()=>{ copyTxt(txt); el.dataset.tip='скопійовано'; el.classList.add('target'); setTimeout(()=>{ el.classList.remove('target'); if(!tgt) delete el.dataset.tip; },700); });
+    box.appendChild(el);
+    return el;
+  };
+  for(let i=0;i<toks.length;i++) mk(toks[i],false);
+  if(S.cur_target){
+    const sep=document.createElement('span');
+    sep.style.cssText='opacity:.45;margin:0 3px;font-size:11px';
+    sep.textContent='→';
+    box.appendChild(sep);
+    mk(S.cur_target,true);
+  }
+}
+
+/* ===== full context ===== */
+function renderWtxt(){
+  if(!S) return;
+  const t=S.window_text;
+  $('wtxt').textContent = t? t : '—';
+}
+
+/* ===== perplexity ===== */
+function renderPerplexity(){
+  if(!S) return;
+  const l=S.loss, le=S.loss_ema;
+  if(l!=null) $('perplexity').textContent = Math.exp(l).toFixed(2);
+  if(le!=null) $('ppl_ema').textContent = Math.exp(le).toFixed(2);
+}
+
+/* ===== knowledge ===== */
+function drawLang(){
+  if(!S) return;
+  const d=S;
+  const box=$('langrates');
+  const loss=d.loss;
+  if(loss==null){ box.innerHTML='<span style="color:var(--faint)">чекаємо перший loss…</span>'; return; }
+  const level=lossLevel(loss);
+  const langs=[
+    {n:'🇺🇦 Українська', pct:level.pct, st:level.txt},
+    {n:'🇷🇺 Російська', pct:0, st:'ще не навчали'},
+    {n:'🇬🇧 Англійська', pct:0, st:'ще не навчали'},
+  ];
+  box.innerHTML=langs.map(l=>
+    '<div class="langrow"><span class="lc">'+l.n+'</span>'
+    +'<span class="lt"><span class="lf" style="width:'+Math.max(2,l.pct)+'%"></span></span>'
+    +'<span class="lp">'+l.pct+'%</span>'
+    +'<span class="ls">'+l.st+'</span></div>'
+  ).join('');
+}
+function lossLevel(loss){
+  if(loss>=9) return {pct:4,txt:'випадкові символи'};
+  if(loss>=5.5) return {pct:9,txt:'перші слова'};
+  if(loss>=4.5) return {pct:18,txt:'окремі слова'};
+  if(loss>=4.0) return {pct:30,txt:'слова злітаються'};
+  if(loss>=3.6) return {pct:45,txt:'просте речення'};
+  if(loss>=3.3) return {pct:60,txt:'граматика'};
+  return {pct:75,txt:'зв\'язний текст'};
+}
+function drawRoadmap(){
+  const box=$('roadmap');
+  const items=[
+    {ic:'🇺🇦',nm:'Українська',st:'в процесі',cls:'proc',ds:'зараз тренуємо'},
+    {ic:'🇷🇺',nm:'Російська',st:'план',cls:'plan',ds:'після української'},
+    {ic:'🇬🇧',nm:'Англійська',st:'план',cls:'plan',ds:'третій етап'},
+  ];
+  box.innerHTML=items.map(it=>
+    '<div class="road '+it.cls+'"><span class="ic">'+it.ic+'</span>'
+    +'<span class="nm">'+it.nm+'</span><span class="ds">'+it.ds+'</span>'
+    +'<span class="st">'+it.st+'</span></div>'
+  ).join('');
+}
+function drawFc(){
+  if(!S) return;
+  const d=S;
+  const tok=(d.total_iters||0)*(d.ctx||1);
+  const target=12465888*20;
+  const pct=Math.min(100,(tok/target*100));
+  $('f_done').textContent=fmt(tok);
+  $('f_target').textContent=fmt(target);
+  $('f_pct').textContent=pct.toFixed(2)+'%';
+  if(d.tokens_per_sec&&d.tokens_per_sec>0){
+    const remain=(target-tok)/d.tokens_per_sec;
+    $('f_eta').textContent=fmtT(remain);
+  }
+  const ep=d.epoch!=null&&d.epochs_total!=null?d.epoch+'/'+d.epochs_total:'—';
+  $('f_epoch').textContent=ep;
+}
+
+/* ===== tabs ===== */
+function initTabs(){
+  document.querySelectorAll('.tab').forEach(tab=>{
+    tab.addEventListener('click',()=>{
+      const host=tab.closest('.tabs').parentElement;
+      host.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+      tab.classList.add('active');
+      host.querySelectorAll('[id^="tab-"]').forEach(p=>{ p.style.display='none'; });
+      const target=host.querySelector('#'+tab.dataset.tab);
+      if(target) target.style.display='';
+    });
+  });
+}
+
+/* ===== header tabs / views ===== */
+function initViews(){
+  const show=(name)=>{
+    document.querySelectorAll('.view').forEach(v=>{
+      v.style.display=(v.id===name)?'grid':'none';
+      v.classList.toggle('active', v.id===name);
+    });
+    document.querySelectorAll('.hd-tab').forEach(t=>{
+      t.classList.toggle('active', t.dataset.view===name);
+    });
+    try{ window.scrollTo(0,0); }catch(_){}
+    if(name==='view-overview'&&S) requestAnimationFrame(renderLoss);
+  };
+  document.querySelectorAll('.hd-tab').forEach(tab=>{
+    tab.addEventListener('click',()=>show(tab.dataset.view));
+  });
+  window.__showView=show;
+}
+
+/* ===== theme ===== */
+function initTheme(){
+  const sel=$('themeSel');
+  try{
+    const saved=localStorage.getItem('shade_theme');
+    if(saved){ sel.value=saved; applyTheme(saved); }
+    else{ applyTheme('auto'); }
+  }catch(_){ applyTheme('auto'); }
+  sel.addEventListener('change',()=>{
+    const v=sel.value;
+    try{ localStorage.setItem('shade_theme',v); }catch(_){}
+    applyTheme(v);
+  });
+}
+function applyTheme(v){
+  const root=document.documentElement;
+  if(v==='auto'){
+    root.classList.remove('light');
+    const dark=window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if(!dark) root.classList.add('light');
+  }else if(v==='dark'){ root.classList.remove('light'); }
+  else if(v==='light'){ root.classList.add('light'); }
+  if(S) renderLoss();
+}
+
+/* ===== pause ===== */
+function initPause(){
+  const btn=$('btnPause');
+  const setBtn=(b,p)=>{ b.textContent=p?'▶ продовжити':'⏸ пауза'; b.classList.toggle('primary',p); };
+  let paused=false;
+  btn.addEventListener('click',()=>{
+    paused=!paused;
+    setBtn(btn,paused);
+    fetch('/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pause:paused})}).then(r=>{
+      if(!r.ok){ toast('сервер без /control','error'); setBtn(btn,false); paused=false; }
+    }).catch(()=>{ toast('керування недоступне','error'); setBtn(btn,false); paused=false; });
+  });
+}
+
+/* ===== export/import ===== */
+function bindExport(btnExportJson,btnExportCsv,btnImportJson){
+  $(btnExportJson).addEventListener('click',()=>{
+    if(!S){ toast('немає даних','error'); return; }
+    const data={state:S,theme:$('themeSel').value,compact:document.body.classList.contains('compact-mode'),time:Date.now()};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download='shade-'+Date.now()+'.json'; a.click();
+    URL.revokeObjectURL(url);
+    toast('стан експортовано','success');
+  });
+  $(btnImportJson).addEventListener('click',()=>{ $('fileImport').click(); });
+  $(btnExportCsv).addEventListener('click',()=>{
+    if(!S||!S.loss_h||!S.loss_h.length){ toast('немає історії','error'); return; }
+    const it_h=S.iters_h||[];
+    const loss_h=S.loss_h, ema_h=S.loss_ema_h||[];
+    let csv='iter,loss,ema\n';
+    for(let i=0;i<loss_h.length;i++) csv+=((it_h[i]!=null?it_h[i]:i)+','+loss_h[i].toFixed(6)+','+(ema_h[i]!=null?ema_h[i].toFixed(6):''))+'\n';
+    const blob=new Blob([csv],{type:'text/csv'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download='loss-'+Date.now()+'.csv'; a.click();
+    URL.revokeObjectURL(url);
+  });
+}
+function initExport(){
+  bindExport('btnExportJson','btnExportCsv','btnImportJson');
+  $('fileImport').addEventListener('change',e=>{
+    const f=e.target.files[0]; if(!f) return;
+    const r=new FileReader();
+    r.onload=()=>{
+      try{
+        const d=JSON.parse(r.result);
+        if(d.state) apply(d.state);
+        if(d.theme){ $('themeSel').value=d.theme; applyTheme(d.theme); }
+        toast('імпорт OK','success');
+      }catch(err){ toast('помилка: '+err.message,'error'); }
+    };
+    r.readAsText(f);
+  });
+}
+
+/* ===== events ===== */
+/* ===== toast ===== */
+function toast(msg,type){
+  const c=document.createElement('div');
+  c.textContent=msg;
+  const colors={success:'#38d39f',error:'#ff5c5c',info:'#4f7cff'};
+  const bkg={success:'rgba(56,211,159,.12)',error:'rgba(255,92,92,.12)',info:'rgba(79,124,255,.12)'};
+  c.style.cssText='position:fixed;bottom:18px;right:18px;background:var(--surface);color:'+(colors[type]||'var(--txt)')+';border:1px solid var(--line);border-radius:10px;padding:10px 14px;font-size:12px;font-weight:600;z-index:200;box-shadow:var(--shadow-lg);animation:toastIn .25s cubic-bezier(.2,.9,.3,1.2)';
+  document.body.appendChild(c);
+  setTimeout(()=>{ c.style.transition='opacity .3s, transform .3s'; c.style.opacity='0'; c.style.transform='translateY(8px)'; setTimeout(()=>c.remove(),300); },3000);
+}
+const styleT=document.createElement('style');
+styleT.textContent='@keyframes toastIn{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}';
+document.head.appendChild(styleT);
+
+/* ===== fullscreen / png ===== */
+function makeFullscreen(cv){
+  if(cv.requestFullscreen) cv.requestFullscreen();
+  else if(cv.webkitRequestFullscreen) cv.webkitRequestFullscreen();
+  else if(cv.msRequestFullscreen) cv.msRequestFullscreen();
+}
+function initFullscreen(){
+  $('lossFullscreen').addEventListener('click',()=>makeFullscreen($('lossplt')));
+}
+function initCanvasExport(){
+  $('lossExportPng').addEventListener('click',()=>{
+    try{
+      const url=$('lossplt').toDataURL('image/png');
+      const a=document.createElement('a'); a.href=url; a.download='loss-'+Date.now()+'.png'; a.click();
+      toast('PNG збережено','success');
+    }catch(e){ toast('помилка: '+e.message,'error'); }
+  });
+}
+
+/* ===== boot ===== */
+initTabs();
+initLoss();
+initTheme(); initPause(); initExport();
+initFullscreen(); initCanvasExport();
+initViews();
+if(window.__showView) window.__showView('view-overview');
+tick();
+setInterval(tick, 400);
+</script>
+</body>
+</html>

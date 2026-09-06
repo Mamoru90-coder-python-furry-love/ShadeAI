@@ -1,0 +1,17 @@
+<!DOCTYPE html><html><body style="background:#111;color:#0f0;font:13px Consolas"><div id="out">…</div>
+<script>
+const out=document.getElementById("out");
+function log(m){out.innerHTML+="<br>"+m;}
+fetch("state.json",{cache:"no-store"}).then(r=>r.json()).then(j=>{
+  try{
+    log("net_it="+j.net_it);
+    log("net.cols="+j.net.cols.length+" net.arcs="+(j.net.arcs?j.net.arcs.length:"MISSING"));
+    log("cols[0]="+JSON.stringify(j.net.cols[0]));
+    log("cols[17]="+JSON.stringify(j.net.cols[17]));
+    log("arcs[0] keys f="+j.net.arcs[0].f+" t="+j.net.arcs[0].t+" p.len="+j.net.arcs[0].p.length);
+    let mx=0; j.net.arcs.forEach(A=>{for(let k=0;k<A.p.length;k+=3){mx=Math.max(mx,A.p[k],A.p[k+1]);}});
+    log("max neuron index in arcs: "+mx);
+    log("col counts: "+j.net.cols.map(c=>c.c).join(","));
+  }catch(e){log("ERR: "+e.message);}
+}).catch(e=>log("FETCH ERR: "+e.message));
+</script></body></html>
