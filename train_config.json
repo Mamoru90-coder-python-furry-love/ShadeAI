@@ -1,0 +1,66 @@
+{
+  "model": {
+    "dim": 256,
+    "blocks": 8,
+    "ctx": 64,
+    "vocab": 12000,
+    "heads": 4,
+    "head_dim": 64
+  },
+  "train_gpt": {
+    "epochs": 120,
+    "window": 10000,
+    "lr": 0.0002,
+    "batch_accum": 8,
+    "clip_grad": 1.0
+  },
+  "train_chat": {
+    "epochs": 3,
+    "ctx": 2048,
+    "lr": 0.0001,
+    "batch": 4,
+    "grad_accum": 4,
+    "clip_grad": 1.0
+  },
+  "train_dpo": {
+    "epochs": 3,
+    "ctx": 2048,
+    "lr": 0.00005,
+    "beta": 0.1,
+    "batch": 2,
+    "grad_accum": 8,
+    "clip_grad": 1.0
+  },
+  "laptop": {
+    "ctx": 1024,
+    "batch": 1,
+    "grad_accum": 16,
+    "fp16": false,
+    "lr_scale": 0.5
+  },
+  "data": {
+    "train_file": "../data/ukr_fiction.txt",
+    "dialogues_file": "../data/dialogues.jsonl",
+    "prefs_file": "../data/preferences.jsonl",
+    "bpe_vocab": "../data/bpe_vocab.txt",
+    "bpe_merges": "../data/bpe_merges.txt"
+  },
+  "checkpoints": {
+    "model_dir": "../model",
+    "best_model": "gpt_best.bin",
+    "resume_model": "gpt_model.bin",
+    "opt_state": "gpt_opt.bin",
+    "save_every_epochs": 1
+  },
+  "dashboard": {
+    "enabled": true,
+    "port": 8765,
+    "dir": "../dashboard",
+    "poll_ms": 400
+  },
+  "logging": {
+    "log_dir": "build",
+    "log_prefix": "train",
+    "save_logs_to_git": true
+  }
+}

@@ -1,0 +1,32 @@
+# Build artifacts
+build/*.exe
+build/*.o
+build/*.obj
+build/*.log
+build/*.err
+build/train*.log
+build/train*.err
+
+# Model checkpoints (keep only latest in git, large files in LFS or external)
+model/*.bin
+model/*.txt
+
+# Temporary files
+*.tmp
+*.temp
+Temp/
+.opencode/
+.sbuild/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local config (secrets, paths)
+local_config.json
