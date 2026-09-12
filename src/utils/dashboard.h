@@ -85,6 +85,8 @@ public:
     std::string ckpt_path = "../model/gpt_model.bin"; // path of the model file (checkpoint base)
     // dynamic endpoints (e.g. /near?i=123): called by the server thread
     std::function<std::string(const std::string& ep, const std::string& qs)> query_handler;
+    // chat handler: takes a user message, returns AI reply (runs inference)
+    std::function<std::string(const std::string& msg)> chat_handler;
 
     void set_ckpt_path(const std::string& p) { ckpt_path = p; }
     void set_paused(bool v) {
@@ -312,6 +314,17 @@ private:
             send_all(c, hd.data(), (int)hd.size());
             send_all(c, body.data(), (int)body.size());
             return;
+        } else if (ep == "/chat") {
+            // POST {"message": "..."} — run inference and return {"reply": "..."}
+            ctype = "application/json; charset=utf-8";
+            std::string msg = json_get(req, "message");
+            std::string reply = "Триває завантаження моделі...";
+            if (chat_handler) {
+                reply = chat_handler(msg);
+            } else {
+                reply = "Чат недоступний. Запустіть shade chat-dash.";
+            }
+            body = "{\"reply\":" + dash::q(reply) + "}";
         } else if (ep == "/control") {
             // POST {"pause":true|false} — toggle training pause
             ctype = "application/json; charset=utf-8";

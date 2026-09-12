@@ -469,11 +469,12 @@ static void help_main() {
     printf("shade — нейромережевий фреймворк\n\n"
            "ВИКОРИСТАННЯ:\n"
            "  shade <команда> [аргументи]\n\n"
-           "КОМАНДИ:\n"
-           "  train   Навчання моделі (GPT, CNN, MLP)\n"
-           "  infer   Генерація тексту з навченої GPT моделі\n"
-           "  chat    Інтерактивний чат з навченою GPT моделлю\n"
-           "  serve   Показати дашборд останнього тренування у браузері\n"
+            "КОМАНДИ:\n"
+            "  train      Навчання моделі (GPT, CNN, MLP)\n"
+            "  infer      Генерація тексту з навченої GPT моделі\n"
+            "  chat       Інтерактивний чат з навченою GPT моделлю\n"
+            "  chat-dash  Чат-дашборд у браузері (з GPT)\n"
+            "  serve      Показати дашборд останнього тренування у браузері\n"
            "\n"
            "ДОВІДКА:\n"
            "  shade <команда> --help\n\n"
@@ -1222,6 +1223,61 @@ void cmd_infer(int argc, char** argv) {
     printf("%s\n", reply.c_str());
 }
 
+static void help_chat_dash() {
+    printf("shade chat-dash — чат-дашборд у браузері з GPT\n\n"
+           "ОПИС:\n"
+           "  Завантажує model/gpt_model.bin + BPE словник\n"
+           "  і запускає веб-дашборд з вкладкою Чат\n\n"
+           "АРГУМЕНТИ:\n"
+           "  --model <файл>  Шлях до файлу моделі\n"
+           "  --port <число>  Порт дашборду (default: 8765)\n"
+           "  --temp <число>  Температура семплінгу (default: 0.8)\n"
+           "  --max-new <число> Макс. токенів на відповідь (default: 128)\n\n"
+           "ПРИКЛАД:\n"
+           "  shade chat-dash\n"
+           "  shade chat-dash --temp 0.9 --max-new 200\n");
+}
+
+void cmd_chat_dash(int argc, char** argv) {
+    if (is_help(argc, argv)) { help_chat_dash(); return; }
+    printf("=== shade chat-dash ===\n"); setbuf(stdout, NULL);
+    std::string model_path = "../model/gpt_model.bin";
+    int port = 8765;
+    float temp = 0.8f; int max_new = 128;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) model_path = argv[++i];
+        if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
+        if (strcmp(argv[i], "--temp") == 0 && i + 1 < argc) temp = (float)atof(argv[++i]);
+        if (strcmp(argv[i], "--max-new") == 0 && i + 1 < argc) max_new = atoi(argv[++i]);
+    }
+    BPETokenizer tok; if (!tok.load("../data/bpe_vocab.txt", "../data/bpe_merges.txt")) { printf("ERROR: can't load bpe vocab\n"); return; }
+    printf("  vocab=%d\n", (int)tok.id2token.size());
+
+    int dim = 128, nb = 6, ml = 32;
+    {
+        auto info = Serialize::read_model_info(model_path);
+        if (info.valid) { dim = info.dim; nb = info.blocks; ml = info.ctx; }
+    }
+    printf("  loading model %s (dim=%d blocks=%d ctx=%d)...\n", model_path.c_str(), dim, nb, ml);
+    GPT gpt(tok.id2token.size(), dim, nb, ml);
+    std::vector<Tensor*> tensors; for (auto* p : gpt.params()) tensors.push_back(p);
+    if (!Serialize::load_model(model_path, tensors).valid) { printf("ERROR: can't load model %s\n", model_path.c_str()); return; }
+    printf("  model loaded\n");
+
+    Dashboard dash;
+    dash.chat_handler = [&gpt, &tok, temp, max_new](const std::string& msg) -> std::string {
+        std::string prompt = "<|im_start|>user\n" + msg + "<|im_end|>\n<|im_start|>assistant\n";
+        auto ids = tok.encode(prompt);
+        std::string reply = gpt.generate(ids, max_new, temp, 20, tok);
+        return reply;
+    };
+    dash.start(port, "../dashboard", true);
+    printf("  chat-dash at http://localhost:%d (press Ctrl+C to quit)\n", port);
+    printf("  waiting...\n");
+    while (dash.running.load()) { Sleep(1000); }
+    dash.stop();
+}
+
 // ===== serve: show the last training run in the browser =====
 static void cmd_serve(int argc, char** argv) {
     if (is_help(argc, argv)) {
@@ -1534,10 +1590,6 @@ static std::pair<std::vector<int>, std::vector<int>> encode_chat(const BPETokeni
         int m = (role == "assistant") ? 1 : 0;
         for (int id : part_ids) { ids.push_back(id); mask.push_back(m); }
     }
-    // add generation prompt
-    std::string gen_prompt = "<|im_start|>assistant\n";
-    auto gen_ids = tok.encode(gen_prompt);
-    for (int id : gen_ids) { ids.push_back(id); mask.push_back(0); }
     return {ids, mask};
 }
 
@@ -1829,6 +1881,9 @@ int main(int argc, char** argv) {
     } else if (strcmp(argv[1], "chat") == 0) {
         if (argc > 2 && (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0)) { help_chat(); return 0; }
         cmd_chat(argc - 2, argv + 2);
+    } else if (strcmp(argv[1], "chat-dash") == 0) {
+        if (argc > 2 && (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0)) { help_chat_dash(); return 0; }
+        cmd_chat_dash(argc - 2, argv + 2);
     } else if (strcmp(argv[1], "infer") == 0) {
         if (argc > 2 && (strcmp(argv[2], "--help") == 0 || strcmp(argv[2], "-h") == 0)) { help_infer(); return 0; }
         cmd_infer(argc - 2, argv + 2);
