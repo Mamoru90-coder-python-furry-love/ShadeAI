@@ -1,8 +1,8 @@
 # ShadeAI C++ — Project Context (Auto-generated)
 
-> **Останнє оновлення:** 2026-09-06
-> **Git commit:** `initial`
-> **Статус:** Активне тренування (SFT чат), дашборд працює
+> **Останнє оновлення:** 2026-09-12
+> **Git commit:** `6139af5`
+> **Статус:** Chat UI + chat-dash ready, 100k діалогів сгенеровано
 
 ---
 
@@ -10,7 +10,7 @@
 Генеративна українська GPT (Transformer) з можливістю:
 - SFT (Supervised Fine-Tuning) на діалогах
 - DPO (Direct Preference Optimization)
-- Чат у браузері з markdown, темами
+- **Чат у браузері** з markdown, темами (vкладка "Чат" додана!)
 - Дашборд з attention-хітмапами, картою слів
 - Тренування на слабкому ноуті (grad accum, resume)
 
@@ -98,6 +98,10 @@ x → attn(x) → +x → ln1 → ffn → +x → ln2 → out
 
 ### Нові команди (додані сьогодні)
 ```bash
+shade chat-dash --model ../model/gpt_model.bin --port 8765 --temp 0.8
+# Запускає дашборд з вкладкою Чат (GPT inference через /chat)
+```
+```bash
 shade train chat --data dialogues.jsonl --epochs 3 --ctx 2048 --lr 0.0001
 shade train dpo  --data prefs.jsonl     --epochs 3 --beta 0.1
 shade chat       --model gpt_model.bin --temp 0.8
@@ -160,7 +164,14 @@ cd build
 ### Chat CLI
 ```bash
 ./shade.exe chat --model ../model/gpt_model.bin --temp 0.8 --max-new 100
+./shade.exe chat-dash --model ../model/gpt_model.bin --port 8765 --temp 0.8 --max-new 128
 ```
+
+### Chat Dashboard (browser)
+```bash
+./shade.exe chat-dash --model ../model/gpt_model.bin --port 8765 --temp 0.8 --max-new 128
+```
+Откриває браузер з дашбордом і вкладкою 💬 Чат. Користувач вводить повідомлення, натискає "Надіслати", сервер запускає GPT inference і повертає відповідь.
 
 ---
 
@@ -182,13 +193,14 @@ cd build
 
 | # | Завдання | Статус |
 |---|----------|--------|
-| 1 | Виправити маскування в `encode_chat` (loss на assistant токенах) | 🔄 В процесі |
-| 2 | Автогенерація діалогів з `ukr_fiction.txt` (100k+ прикладів) | ⏳ |
-| 3 | Дашборд: вкладки Dashboard ↔ Chat, markdown, тема "шоколад" | ⏳ |
-| 4 | Чат у браузері (WebSocket, markdown рендеринг) | ⏳ |
-| 5 | DPO trainer (повний backward через logprob) | ⏳ |
-| 6 | Grad accum + int8 квантизація для ноутбука | ⏳ |
-| 7 | Auto-commit hook + AI_PROMPT.md | ✅ Зараз |
+| 1 | Виправити маскування в `encode_chat` (видалено gen_prompt) | ✅ Готово |
+| 2 | Автогенерація діалогів з `ukr_fiction.txt` (100k+ прикладів) | ✅ Готово (100k) |
+| 3 | Дашборд: вкладки Dashboard ↔ Chat, markdown, тема "шоколад" | ✅ Готово (Chat tab + CSS) |
+| 4 | Чат у браузері (POST /chat, shade chat-dash) | ✅ Готово |
+| 5 | SFT тренування на 100k діалогах (з 10 → 100k) | ⏳ |
+| 6 | DPO trainer (повний backward через logprob) | ⏳ |
+| 7 | Grad accum + int8 квантизація для ноутбука | ⏳ |
+| 8 | SSE streaming для чату (замовити POST → потік відповідей) | ⏳ |
 
 ---
 
