@@ -1714,7 +1714,7 @@ void cmd_train_chat(int argc, char** argv) {
 
         // Save checkpoint
         std::vector<Tensor*> tensors; for (auto* p : gpt.params()) tensors.push_back(p);
-        Serialize::save("../model/gpt_model.bin", tensors);
+        Serialize::save_model("../model/gpt_model.bin", tensors, dim, nb, ctx);
     }
     if (dash_on) dash.stop();
     printf("  saved to model/gpt_model.bin\n");
@@ -1834,7 +1834,7 @@ void cmd_train_dpo(int argc, char** argv) {
         if (dash_on) { dash.set("epoch", ep); dash.set("epoch_loss", avg); }
 
         std::vector<Tensor*> tensors; for (auto* p : policy.params()) tensors.push_back(p);
-        Serialize::save("../model/gpt_model.bin", tensors);
+        Serialize::save_model("../model/gpt_model.bin", tensors, dim, nb, ctx);
     }
     if (dash_on) dash.stop();
     printf("  saved to model/gpt_model.bin\n");
