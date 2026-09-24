@@ -1662,6 +1662,24 @@ void cmd_train_chat(int argc, char** argv) {
     Dashboard dash;
     if (dash_on) dash.start(dash_port, "../dashboard", true);
 
+    // dashboard history + metrics: keep the UI (loss chart, summary) alive during SFT
+    std::vector<double> loss_h, ema_h, iters_h;
+    double ema_loss = -1.0, global_min_loss = 1e29, last_avg = 0;
+    long long total_iters = 0;
+    double tick_prev = 0, tick_loss = 0, tick_tokens = 0; int tick_n = 0;
+    if (dash_on) {
+        dash.set("status", "training");
+        dash.set("epochs_total", (double)epochs);
+        dash.set("vocab", (double)vocab);
+        dash.set("dim", (double)dim);
+        dash.set("blocks", (double)nb);
+        dash.set("ctx", (double)ctx);
+        dash.set("lr", lr);
+        double pcount = 0; for (auto* p : gpt.params()) pcount += (double)p->size();
+        dash.set("params", pcount);
+        dash.event("SFT: " + std::to_string(dialogues.size()) + " діалогів · " + std::to_string(epochs) + " епох · " + std::to_string(dim) + "d/" + std::to_string(nb) + "blk");
+    }
+
     for (int ep = 0; ep < epochs; ep++) {
         float tl = 0; int iters = 0;
         double t0 = clock();
@@ -1704,19 +1722,64 @@ void cmd_train_chat(int argc, char** argv) {
             opt.zero_grad(gpt.grads());
 
             tl += loss; iters++;
-            if (dash_on) dash.set("loss", loss);
+            if (dash_on) {
+                total_iters++;
+                tick_loss += loss; tick_n++; tick_tokens += (double)ids.size();
+                double nowc = (double)clock();
+                if (tick_prev <= 0) tick_prev = nowc;
+                if (nowc - tick_prev >= CLOCKS_PER_SEC * 0.5) {
+                    double span = (nowc - tick_prev) / CLOCKS_PER_SEC;
+                    double avg_t = tick_n ? tick_loss / tick_n : 0.0;
+                    double tps = span > 0 ? tick_tokens / span : 0.0;
+                    tick_loss = 0; tick_n = 0; tick_tokens = 0; tick_prev = nowc;
+                    if (ema_loss < 0) ema_loss = avg_t; else ema_loss = 0.9 * ema_loss + 0.1 * avg_t;
+                    if (avg_t < global_min_loss) global_min_loss = avg_t;
+                    loss_h.push_back(avg_t); ema_h.push_back(ema_loss); iters_h.push_back((double)total_iters);
+                    int hcap = 600;
+                    if ((int)loss_h.size() > hcap) {
+                        int drop = (int)loss_h.size() - hcap;
+                        loss_h.erase(loss_h.begin(), loss_h.begin() + drop);
+                        ema_h.erase(ema_h.begin(), ema_h.begin() + drop);
+                        iters_h.erase(iters_h.begin(), iters_h.begin() + drop);
+                    }
+                    dash.setRaw("loss_h", dash::vec(loss_h));
+                    dash.setRaw("loss_ema_h", dash::vec(ema_h));
+                    dash.setRaw("iters_h", dash::vec(iters_h));
+                    dash.set("loss", avg_t);
+                    dash.set("loss_ema", ema_loss);
+                    dash.set("global_min_loss", global_min_loss);
+                    dash.set("epoch", (double)(ep + 1));
+                    dash.set("epoch_iters", (double)iters);
+                    dash.set("epoch_iters_total", (double)idx.size());
+                    dash.set("total_iters", (double)total_iters);
+                    dash.set("tokens_per_sec", tps);
+                    dash.set("lr", lr);
+                }
+            }
         }
 
         double t1 = clock();
         float avg = tl / fmaxf(1, iters);
+        last_avg = avg;
         printf("  ep %2d loss=%.4f [%.0fs, %d iters]\n", ep, avg, (t1 - t0) / CLOCKS_PER_SEC, iters);
-        if (dash_on) { dash.set("epoch", ep); dash.set("epoch_loss", avg); }
+        if (dash_on) {
+            dash.set("epoch", (double)(ep + 1));
+            dash.set("epoch_loss", avg);
+            dash.event("Епоха " + std::to_string(ep + 1) + "/" + std::to_string(epochs) + ": loss " + dash::num(avg));
+        }
 
         // Save checkpoint
         std::vector<Tensor*> tensors; for (auto* p : gpt.params()) tensors.push_back(p);
         Serialize::save_model("../model/gpt_model.bin", tensors, dim, nb, ctx);
     }
-    if (dash_on) dash.stop();
+    if (dash_on) {
+        dash.set("status", "finished");
+        dash.set("final_loss", last_avg);
+        dash.event("SFT завершено: " + std::to_string(total_iters) + " кроків, фінальний loss " + dash::num(last_avg));
+        dash.persist("../dashboard");
+        dash.stop();
+        printf("  dashboard snapshot: ../dashboard/last_state.json (перегляд: shade serve)\n");
+    }
     printf("  saved to model/gpt_model.bin\n");
 }
 
