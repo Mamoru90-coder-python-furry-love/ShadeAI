@@ -38,6 +38,19 @@ struct CharRNN {
     // GPT::compute_loss). Callers accumulating several windows must then
     // average over the window count before clipping/stepping.
     float compute_loss(const Tensor& logits, const Tensor& targets, Tensor& dlogits) {
+        // Guard the function for reuse outside the demo: a wrong logits width,
+        // a length mismatch, or an out-of-range / non-integral target would
+        // otherwise index past the row or divide by zero.
+        if (logits.cols != vocab_size)
+            throw std::invalid_argument("CharRNN::compute_loss: invalid logits width");
+        if (logits.rows <= 0 || targets.size() != logits.rows)
+            throw std::invalid_argument("CharRNN::compute_loss: invalid sequence length");
+        for (i32 i = 0; i < targets.size(); i++) {
+            int tgt = (int)targets.data[i];
+            if (targets.data[i] != (f32)tgt || tgt < 0 || tgt >= vocab_size)
+                throw std::invalid_argument("CharRNN::compute_loss: invalid target ID");
+        }
+
         i32 T = logits.rows;
         dlogits = Tensor(T, vocab_size, 0.0f);
         float loss = 0;

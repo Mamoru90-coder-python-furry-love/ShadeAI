@@ -228,6 +228,40 @@ static bool charrnn_loss_gradcheck() {
     return ok;
 }
 
+// compute_loss is reachable outside the demo now; verify the input guards
+// reject malformed data instead of indexing past the row or dividing by zero.
+static bool charrnn_loss_validation_check() {
+    CharRNN model(8, 4, 6);
+    Tensor dlogits;
+    bool ok = true;
+    auto rejects = [&](const char* what, const Tensor& logits, const Tensor& targets) {
+        bool threw = false;
+        try { model.compute_loss(logits, targets, dlogits); }
+        catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr, "CharRNNVal: %s was not rejected\n", what);
+            ok = false;
+        }
+    };
+    Tensor good_logits = random_tensor(5, 8);
+    Tensor good_targets(1, 5);
+    for (i32 i = 0; i < good_targets.cols; i++) good_targets.data[i] = (f32)(i % 8);
+
+    rejects("wrong logits width", random_tensor(5, 7), good_targets);
+    rejects("empty sequence", Tensor(), Tensor());
+    rejects("length mismatch", good_logits, Tensor(1, 4));
+
+    Tensor t = good_targets.clone(); t.data[0] = -1.0f;
+    rejects("negative target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 8.0f;
+    rejects("target >= vocab", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 1.5f;
+    rejects("non-integral target", good_logits, t);
+
+    std::printf("%-12s %s\n", "CharRNNVal", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Regression for the NaN trap: `NaN > worst` is false, so a non-finite
 // gradient used to be able to leave worst at 0 and report a false OK. Probe
 // both paths: a NaN analytic gradient and a NaN numeric (forward) gradient.
@@ -381,6 +415,7 @@ int main() {
 
     ok &= gpt_loss_gradcheck();
     ok &= charrnn_loss_gradcheck();
+    ok &= charrnn_loss_validation_check();
     ok &= nan_guard_selftests();
 
     if (!ok) {

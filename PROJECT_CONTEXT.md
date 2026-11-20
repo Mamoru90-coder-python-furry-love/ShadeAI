@@ -71,7 +71,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 
 ```
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss); NaN-guard self-test
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss) + валідація входів CharRNN::compute_loss (CharRNNVal); NaN-guard self-test
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
 tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
@@ -94,7 +94,9 @@ Attention       OK  worst rel err 2.55e-05
 Embedding       OK  worst rel err 9.90e-06
 TransformerBlock OK worst rel err 2.68e-05
 GPT             OK  worst rel err 3.48e-05
-GPTLoss         OK  worst rel err 1.72e-04
+CharRNN         OK  worst rel err 3.43e-05
+GPTLoss         OK  worst rel err 1.60e-04
+CharRNNLoss     OK  worst rel err 1.44e-04
 ```
 
 ### Виправлені математичні помилки
@@ -162,6 +164,8 @@ Embedding використовує послідовність із **повто�
 - додано `CharRNN::compute_loss(logits, targets, dlogits)` за аналогією з `GPT::compute_loss`: повертає **середню** CE по токенах і пише `dlogits = (p - onehot)/T`, тобто градієнт саме повернутого mean-loss;
 - навчальний цикл тепер викликає `compute_loss` замість інлайн-обчислення, а накопичені по вікнах градієнти ділить на `iters` **до** `clip_grads` і `opt.step` — так optimizer бачить градієнт того самого mean-loss, що друкується (`total_loss / iters`);
 - `CharRNNLoss` окремо звіряє `dlogits` із finite-difference скалярного mean-loss (найгірша похибка 1.44e-04).
+
+**Валідація входів `CharRNN::compute_loss`.** Оскільки функція тепер доступна поза демо, додано перевірки на початку: `logits.cols == vocab_size`, `logits.rows > 0`, `targets.size() == logits.rows`, і кожен target — ціле в межах `[0, vocab_size)`. Без них некоректні дані давали б вихід за межі рядка або ділення на нуль. `CharRNNVal` перевіряє, що всі п'ять видів некоректного вводу (ширина, порожня послідовність, розсинхрон довжин, від'ємний ID, ID ≥ vocab, дробовий ID) відхиляються через `std::invalid_argument`. Негативний контроль із вимкненими guard-ами не запускався навмисно: кожен такий випадок без guard-а є UB, тож результат був би оманливим.
 
 Перевірено запуском `main_rnn.cpp`: loss падає 3.30 → 0.44 за 300 епох, генерація працює, `exit=0`. Зміна зачіпає `src/demos/char_rnn.cpp` (виклик OK, але це вперше в цьому етапі змінюється код демо) і `tests/gradcheck.cpp`.
 
