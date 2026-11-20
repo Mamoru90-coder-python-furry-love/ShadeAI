@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/tensor.h"
+#include "../core/simd.h"
 #include <vector>
 
 struct AdamW {
@@ -31,7 +32,29 @@ struct AdamW {
             f32* pm = m[i].data.data();
             f32* pv = v[i].data.data();
             const i32 n = params[i]->size();
-            for (i32 j = 0; j < n; j++) {
+            i32 j = 0;
+#if defined(__AVX__)
+            const __m256 b1 = simd::set8(beta1), b2 = simd::set8(beta2);
+            const __m256 c1 = simd::set8(1.0f - beta1), c2 = simd::set8(1.0f - beta2);
+            const __m256 kmv = simd::set8(km), kwv = simd::set8(kw);
+            const __m256 ib2v = simd::set8(ib2), epsv = simd::set8(eps);
+            for (; j + 8 <= n; j += 8) {
+                __m256 gv = simd::load8(g + j);
+                __m256 mv = simd::load8(pm + j);
+                __m256 vv = simd::load8(pv + j);
+                __m256 pv_ = simd::load8(p + j);
+                __m256 mi = _mm256_add_ps(_mm256_mul_ps(b1, mv), _mm256_mul_ps(c1, gv));
+                __m256 vi = _mm256_add_ps(_mm256_mul_ps(b2, vv),
+                                          _mm256_mul_ps(c2, _mm256_mul_ps(gv, gv)));
+                simd::store8(pm + j, mi);
+                simd::store8(pv + j, vi);
+                __m256 den = _mm256_add_ps(_mm256_sqrt_ps(_mm256_mul_ps(vi, ib2v)), epsv);
+                __m256 np = _mm256_sub_ps(pv_, _mm256_div_ps(_mm256_mul_ps(kmv, mi), den));
+                np = _mm256_sub_ps(np, _mm256_mul_ps(kwv, np));
+                simd::store8(p + j, np);
+            }
+#endif
+            for (; j < n; j++) {
                 f32 gi = g[j];
                 f32 mi = beta1 * pm[j] + (1 - beta1) * gi;
                 f32 vi = beta2 * pv[j] + (1 - beta2) * gi * gi;

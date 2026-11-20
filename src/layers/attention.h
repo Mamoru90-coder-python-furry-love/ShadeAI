@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/tensor.h"
+#include "../core/simd.h"
 #include <cmath>
 
 struct SelfAttention {
@@ -36,47 +37,41 @@ struct SelfAttention {
         last_out = Tensor(T, embed_dim, 0.0f);
 
         for (i32 h = 0; h < num_heads; h++) {
-            const f32* Qh = &last_q.data[h * head_dim];
-            const f32* Kh = &last_k.data[h * head_dim];
-            const f32* Vh = &last_v.data[h * head_dim];
-            f32* oh = &last_out.data[h * head_dim];
+            const f32* Qh = last_q.data.data() + (size_t)h * head_dim;
+            const f32* Kh = last_k.data.data() + (size_t)h * head_dim;
+            const f32* Vh = last_v.data.data() + (size_t)h * head_dim;
+            f32* oh = last_out.data.data() + (size_t)h * head_dim;
             Tensor sm(T, T, 0.0f);
             f32* smp = sm.data.data();
 
-            // fused: QK^T + scale + mask + softmax-max per row
+            // K as T x head_dim and V^T as head_dim x T: both dot products become contiguous
+            Tensor Kc(T, head_dim), Vt(head_dim, T);
+            f32* kd = Kc.data.data();
+            f32* vd = Vt.data.data();
+            for (i32 i = 0; i < T; i++) {
+                const f32* kr = Kh + (size_t)i * embed_dim;
+                const f32* vr = Vh + (size_t)i * embed_dim;
+                for (i32 c = 0; c < head_dim; c++) {
+                    kd[(size_t)i * head_dim + c] = kr[c];
+                    vd[(size_t)c * T + i] = vr[c];
+                }
+            }
+
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
             for (i32 i = 0; i < T; i++) {
-                f32 maxv = -1e30f;
-                // pass 1: QK^T + scale + mask, find max
+                const f32* qrow = Qh + (size_t)i * embed_dim;
+                f32* row = smp + (size_t)i * T;
                 for (i32 j = 0; j < T; j++) {
-                    f32 s = 0;
-                    for (i32 k = 0; k < head_dim; k++)
-                        s += Qh[i * embed_dim + k] * Kh[j * embed_dim + k];
-                    s *= scale;
-                    if (causal && j > i) s = -1e30f;
-                    if (h == 0) last_scores.data[i * T + j] = s;
-                    if (s > maxv) maxv = s;
-                    smp[i * T + j] = s; // store scores temporarily
+                    f32 s = (causal && j > i) ? -1e30f
+                          : simd::dot(qrow, kd + (size_t)j * head_dim, head_dim) * scale;
+                    row[j] = s;
+                    if (h == 0) last_scores.data[(size_t)i * T + j] = s;
                 }
-                // pass 2: exp and normalize
-                f32 sum = 0;
-                for (i32 j = 0; j < T; j++) {
-                    f32 e = std::exp(smp[i * T + j] - maxv);
-                    smp[i * T + j] = e;
-                    sum += e;
-                }
-                f32 inv = 1.0f / sum;
-                for (i32 j = 0; j < T; j++)
-                    smp[i * T + j] *= inv;
-                // pass 3: scores × V (write directly to last_out)
-                for (i32 j = 0; j < head_dim; j++) {
-                    f32 s = 0;
-                    for (i32 k = 0; k < T; k++)
-                        s += smp[i * T + k] * Vh[k * embed_dim + j];
-                    oh[i * embed_dim + j] = s;
-                }
+                simd::softmax_row(row, T);
+                for (i32 c = 0; c < head_dim; c++)
+                    oh[(size_t)i * embed_dim + c] = simd::dot(row, vd + (size_t)c * T, T);
             }
             head_softmax[h] = sm;
             if (h == 0) last_softmax = sm;

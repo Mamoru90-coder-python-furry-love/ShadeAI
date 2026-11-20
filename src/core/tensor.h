@@ -110,28 +110,47 @@ struct Tensor {
         #pragma omp parallel for schedule(static)
 #endif
         for (i32 i = 0; i < M; i++) {
-            f32* rp = &r.data[i * P];
-            const f32* dp = &data[i * N];
-            for (i32 k = 0; k < N; k++) {
-                f32 v = dp[k];
-                if (v == 0.0f) continue;
-                const f32* op = &o.data[k * P];
+            f32* rp = r.data.data() + (size_t)i * P;
+            const f32* dp = data.data() + (size_t)i * N;
+            i32 k = 0;
 #if defined(__AVX__) || defined(__AVX2__)
+            const i32 jlim = P & ~7;
+            // 4 independent accumulators: 4x fewer load/store of the output row
+            for (; k + 4 <= N; k += 4) {
+                const f32* b0 = o.data.data() + (size_t)k * P;
+                const f32* b1 = b0 + P;
+                const f32* b2 = b1 + P;
+                const f32* b3 = b2 + P;
+                __m256 a0 = _mm256_set1_ps(dp[k]);
+                __m256 a1 = _mm256_set1_ps(dp[k + 1]);
+                __m256 a2 = _mm256_set1_ps(dp[k + 2]);
+                __m256 a3 = _mm256_set1_ps(dp[k + 3]);
                 i32 j = 0;
-                // vectorized tail-free dot-product accumulation over P in 8-wide AVX chunks
-                i32 jlim = P & ~7;
                 for (; j < jlim; j += 8) {
-                    __m256 bv = _mm256_loadu_ps(op + j);
-                    __m256 cv = _mm256_loadu_ps(rp + j);
-                    __m256 pv = _mm256_mul_ps(_mm256_set1_ps(v), bv);
-                    _mm256_storeu_ps(rp + j, _mm256_add_ps(cv, pv));
+                    __m256 acc = _mm256_mul_ps(a0, _mm256_loadu_ps(b0 + j));
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(a1, _mm256_loadu_ps(b1 + j)));
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(a2, _mm256_loadu_ps(b2 + j)));
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(a3, _mm256_loadu_ps(b3 + j)));
+                    _mm256_storeu_ps(rp + j, _mm256_add_ps(_mm256_loadu_ps(rp + j), acc));
                 }
                 for (; j < P; j++)
-                    rp[j] += v * op[j];
-#else
-                for (i32 j = 0; j < P; j++)
-                    rp[j] += v * op[j];
+                    rp[j] += dp[k] * b0[j] + dp[k + 1] * b1[j]
+                           + dp[k + 2] * b2[j] + dp[k + 3] * b3[j];
+            }
 #endif
+            for (; k < N; k++) {
+                f32 v = dp[k];
+                if (v == 0.0f) continue;
+                const f32* bp = o.data.data() + (size_t)k * P;
+                i32 j = 0;
+#if defined(__AVX__) || defined(__AVX2__)
+                for (; j < jlim; j += 8) {
+                    __m256 bv = _mm256_loadu_ps(bp + j);
+                    __m256 cv = _mm256_loadu_ps(rp + j);
+                    _mm256_storeu_ps(rp + j, _mm256_add_ps(cv, _mm256_mul_ps(_mm256_set1_ps(v), bv)));
+                }
+#endif
+                for (; j < P; j++) rp[j] += v * bp[j];
             }
         }
         return r;
