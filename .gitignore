@@ -3,6 +3,7 @@
 build/*.exe
 build/*.o
 build/*.obj
+tests/fixtures/*.exe
 build/*.log
 build/*.err
 build/train*.log

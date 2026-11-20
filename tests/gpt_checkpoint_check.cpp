@@ -236,36 +236,37 @@ int main() {
         return write_all(bad, b);
     };
 
+    // v2 header: magic@0, version@4, crc@8, vocab@12, dim@16, blocks@20, ctx@24.
     expect(poke_i32(0, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "bad magic rejected");
-    expect(poke_i32(8, 10000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(12, 10000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "absurd vocab rejected");
-    expect(poke_i32(12, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(16, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "invalid dim rejected");
 
     // Individually legal dim/ctx combine into a 6.5e10-element activation.
-    expect(poke2_i32(12, 65536, 20, 1000000) &&
+    expect(poke2_i32(16, 65536, 24, 1000000) &&
            !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "combined config budget rejected");
 
     // vocab passes its own cap but makes the *model* (params + grads) huge.
-    expect(poke_i32(8, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(12, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "model budget rejected before GPT construction");
 
     // Long context blows up the T*T attention buffers even with a tiny dim.
-    expect(poke_i32(20, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(24, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "attention activation budget rejected");
 
     // TransformerBlock/self-attention require dim divisible by 4.
-    expect(poke_i32(12, 15) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(16, 15) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "dim not divisible by 4 rejected");
 
-    // "<PAD>" starts at 24 (header) + 4 (word count) + 4 (its length).
-    expect(poke_byte(32, 'X') && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    // "<PAD>" starts at 28 (v2 header) + 4 (word count) + 4 (its length).
+    expect(poke_byte(36, 'X') && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "corrupt special token in checkpoint rejected");
 
     // First tensor block sits after the tokenized vocabulary and tensor count.
-    size_t tensor_off = 24 + 4;
+    size_t tensor_off = 28 + 4;
     for (const auto& w : tok.id2word) tensor_off += 4 + w.size();
     tensor_off += 4;
     expect(poke2_i32(tensor_off, 100000, tensor_off + 4, 100000) &&

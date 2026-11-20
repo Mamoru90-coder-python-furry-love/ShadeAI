@@ -24,6 +24,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <memory>
 
@@ -185,7 +186,13 @@ struct GPT {
 // rejected without ever touching a live model.
 // ---------------------------------------------------------------------------
 static constexpr i32 GPT_MAGIC = 0x53484447; // "SHDG"
-static constexpr i32 GPT_VERSION = 1;
+// Fixed-width, little-endian (x86/x64) integer fields; floats are IEEE-754
+// binary32. v1 header: magic, version, vocab, dim, blocks, ctx (24 bytes).
+// v2 inserts a u32 CRC-32 at offset 8; config therefore starts at offset 12.
+static constexpr i32 GPT_VERSION_V1 = 1;
+static constexpr i32 GPT_VERSION_V2 = 2;
+static constexpr i32 GPT_VERSION = GPT_VERSION_V2; // new saves
+static constexpr size_t GPT_CRC_OFFSET = 8;
 // 50M floats = 200 MB. A hostile config must be rejected before any GPT object
 // is built. Weights, gradients and Dense transpose caches all count.
 static constexpr int64_t GPT_MAX_MODEL_ELEMS = 50000000;
@@ -360,6 +367,59 @@ static bool gpt_config_budget(const GPTConfig& c, int64_t& out_params) {
     return true;
 }
 
+// ---- checkpoint integrity: CRC-32 (IEEE 802.3, reflected poly 0xEDB88320) ----
+// Detects accidental corruption, NOT deliberate tampering. Init 0xFFFFFFFF,
+// final XOR 0xFFFFFFFF. The table is generated once, no external dependency.
+static uint32_t gpt_crc32_update(uint32_t crc, const void* data, size_t n) {
+    static const std::array<uint32_t, 256> table = [] {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++)
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            t[i] = c;
+        }
+        return t;
+    }();
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; i++) crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return crc;
+}
+static bool gpt_read_u32(FILE* f, uint32_t& v) {
+    return Serialize::detail::read_exact(f, &v, sizeof(v));
+}
+static bool gpt_write_u32(FILE* f, uint32_t v) {
+    return Serialize::detail::write_exact(f, &v, sizeof(v));
+}
+
+// Stream the whole file with a FIXED buffer, CRC-ing every byte except the
+// 4-byte checksum field at GPT_CRC_OFFSET. No allocation depends on file size,
+// so a hostile length cannot exhaust RAM. Leaves the file at EOF.
+static bool gpt_compute_file_crc(FILE* f, uint32_t& out) {
+    if (fseek(f, 0, SEEK_SET) != 0) return false;
+    uint32_t crc = 0xFFFFFFFFu;
+    unsigned char buf[65536];
+    size_t pos = 0;
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0) break;
+        const size_t end = pos + n;
+        if (pos < GPT_CRC_OFFSET) {
+            size_t e = std::min(end, GPT_CRC_OFFSET);
+            crc = gpt_crc32_update(crc, buf, e - pos);
+        }
+        if (end > GPT_CRC_OFFSET + 4) {
+            size_t s = std::max(pos, GPT_CRC_OFFSET + 4);
+            crc = gpt_crc32_update(crc, buf + (s - pos), end - s);
+        }
+        pos = end;
+        if (n < sizeof(buf)) break;
+    }
+    if (ferror(f)) return false;
+    out = crc ^ 0xFFFFFFFFu;
+    return true;
+}
+
 static bool atomic_replace(const std::string& tmp, const std::string& dst) {
 #ifdef _WIN32
     return MoveFileExA(tmp.c_str(), dst.c_str(),
@@ -372,15 +432,19 @@ static bool atomic_replace(const std::string& tmp, const std::string& dst) {
 bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     using namespace Serialize::detail;
     // Write to a sibling temp file first. The previous good checkpoint stays
-    // untouched until the whole file is on disk and the rename succeeds.
+    // untouched until the whole file, INCLUDING its checksum, is on disk and
+    // the atomic rename succeeds.
     const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
+    // Read/write mode: after writing the payload we read it back to compute
+    // the checksum before patching the CRC field.
+    FILE* f = fopen(tmp.c_str(), "w+b");
     if (!f) return false;
     bool ok = true;
     auto wi = [&](i32 v) { if (ok) ok = write_i32(f, v); };
 
     wi(GPT_MAGIC);
     wi(GPT_VERSION);
+    if (ok) ok = gpt_write_u32(f, 0); // checksum placeholder, patched below
     wi(gpt.vocab_size);
     wi(gpt.dim);
     wi(gpt.num_blocks);
@@ -392,6 +456,13 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     for (auto* p : params) {
         if (!ok) break;
         ok = write_tensor(f, *p);
+    }
+
+    if (ok) {
+        uint32_t crc = 0;
+        if (fflush(f) != 0 || !gpt_compute_file_crc(f, crc)) ok = false;
+        if (ok && fseek(f, (long)GPT_CRC_OFFSET, SEEK_SET) != 0) ok = false;
+        if (ok) ok = gpt_write_u32(f, crc);
     }
     if (fclose(f) != 0) ok = false;
     if (!ok || !atomic_replace(tmp, path)) {
@@ -406,32 +477,47 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
     using namespace Serialize::detail;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
+
+    // Nothing is written to the caller until EVERY stage succeeds.
+    GPTConfig parsed{};
+    Tokenizer parsed_tok;
+    std::vector<Tensor> staged;
     bool ok = false;
     do {
+        // 1-4: open, header, version.
         i32 magic, ver;
         if (!read_i32(f, magic) || !read_i32(f, ver)) break;
-        if (magic != GPT_MAGIC || ver != GPT_VERSION) break;
-        if (!read_i32(f, cfg.vocab) || !read_i32(f, cfg.dim) ||
-            !read_i32(f, cfg.blocks) || !read_i32(f, cfg.max_len)) break;
+        if (magic != GPT_MAGIC) break;
+        if (ver != GPT_VERSION_V1 && ver != GPT_VERSION_V2) break;
 
-        // Reject absurd values before they turn into allocations or loops.
-        if (cfg.vocab < Tokenizer::SPECIAL || cfg.vocab > 1000000) break;
-        if (cfg.dim < 1 || cfg.dim > 65536) break;
-        if (cfg.blocks < 1 || cfg.blocks > 1024) break;
-        if (cfg.max_len < 1 || cfg.max_len > 1000000) break;
+        // 5-6: v2 verifies the checksum BEFORE any payload is parsed. v1 has
+        // no checksum field and keeps its original layout (config at offset 8).
+        if (ver == GPT_VERSION_V2) {
+            uint32_t stored_crc = 0, computed_crc = 0;
+            if (!gpt_read_u32(f, stored_crc)) break;
+            if (!gpt_compute_file_crc(f, computed_crc) || computed_crc != stored_crc) break;
+            if (fseek(f, (long)(GPT_CRC_OFFSET + 4), SEEK_SET) != 0) break;
+        }
+
+        // 7: config, tokenizer, tensor shapes/count, all before staging data.
+        if (!read_i32(f, parsed.vocab) || !read_i32(f, parsed.dim) ||
+            !read_i32(f, parsed.blocks) || !read_i32(f, parsed.max_len)) break;
+        if (parsed.vocab < Tokenizer::SPECIAL || parsed.vocab > 1000000) break;
+        if (parsed.dim < 1 || parsed.dim > 65536) break;
+        if (parsed.blocks < 1 || parsed.blocks > 1024) break;
+        if (parsed.max_len < 1 || parsed.max_len > 1000000) break;
 
         // Reject the whole architecture before infer_gpt() constructs it:
         // params + gradients + caches + activations, not just file size.
         int64_t expected_params = 0;
-        if (!gpt_config_budget(cfg, expected_params)) break;
-        const auto expected = gpt_expected_shapes(cfg);
+        if (!gpt_config_budget(parsed, expected_params)) break;
+        const auto expected = gpt_expected_shapes(parsed);
 
-        if (!tok.read(f) || tok.vocab_size != cfg.vocab) break;
+        if (!parsed_tok.read(f) || parsed_tok.vocab_size != parsed.vocab) break;
 
         i32 nt;
         if (!read_i32(f, nt) || nt != (i32)expected.size()) break;
-        weights.clear();
-        weights.reserve(expected.size());
+        staged.reserve(expected.size());
         int64_t total_elems = 0;
         for (size_t i = 0; i < expected.size(); i++) {
             Tensor t;
@@ -440,14 +526,21 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
             const size_t remaining = (size_t)(expected_params - total_elems);
             if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining)) break;
             total_elems += (int64_t)t.rows * t.cols;
-            weights.push_back(std::move(t));
+            staged.push_back(std::move(t));
         }
-        if (weights.size() != expected.size() || total_elems != expected_params
+        // 8: whole-file validation (no truncation and no trailing bytes).
+        if (staged.size() != expected.size() || total_elems != expected_params
             || !at_eof(f)) break;
         ok = true;
     } while (false);
     fclose(f);
-    return ok;
+
+    // 9: commit only after every stage passed.
+    if (!ok) return false;
+    cfg = parsed;
+    tok = std::move(parsed_tok);
+    weights = std::move(staged);
+    return true;
 }
 
 void train_gpt(const std::string& data_path, const std::string& model_path) {
