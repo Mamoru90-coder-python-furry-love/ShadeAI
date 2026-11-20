@@ -3,7 +3,9 @@
 #include "../layers/dense.h"
 #include "../layers/activations.h"
 #include "../optimizer/adamw.h"
+#ifndef SHADE_MLP_NO_MAIN
 #include "../utils/mnist.h"
+#endif
 #include <cstdio>
 #include <cmath>
 
@@ -11,8 +13,13 @@ struct MLP {
     Dense f1, f2, f3;
     Act a1, a2;
 
-    MLP() : f1(784, 256, true), f2(256, 128, true), f3(128, 10, false),
-            a1(Activation::RELU), a2(Activation::RELU) {}
+    MLP() : MLP(784, 256, 128, 10) {}
+
+    // Dimension-configurable for gradient checking with a tiny model; the
+    // default MNIST shape above is unchanged.
+    MLP(i32 in, i32 h1, i32 h2, i32 out)
+        : f1(in, h1, true), f2(h1, h2, true), f3(h2, out, false),
+          a1(Activation::RELU), a2(Activation::RELU) {}
 
     Tensor forward(const Tensor& x) {
         Tensor h = a1.forward(f1.forward(x));
@@ -20,16 +27,18 @@ struct MLP {
         return f3.forward(h);
     }
 
-    void backward(const Tensor& d) {
+    // Returns d(input); callers that ignore it (the CLI demo) still compile.
+    Tensor backward(const Tensor& d) {
         Tensor h = f3.backward(d);
         h = f2.backward(a2.backward(h));
-        f1.backward(a1.backward(h));
+        return f1.backward(a1.backward(h));
     }
 
     std::vector<Tensor*> params() { return {&f1.w, &f1.b, &f2.w, &f2.b, &f3.w, &f3.b}; }
     std::vector<Tensor*> grads() { return {&f1.gw, &f1.gb, &f2.gw, &f2.gb, &f3.gw, &f3.gb}; }
 };
 
+#ifndef SHADE_MLP_NO_MAIN
 int main() {
     setbuf(stdout, NULL);
     printf("=== MNIST MLP ===\n");
@@ -85,3 +94,4 @@ int main() {
 
     return 0;
 }
+#endif // SHADE_MLP_NO_MAIN

@@ -16,6 +16,12 @@
 // The char-RNN demo has no main, so it can be included directly to check the
 // real embedding -> GRU (BPTT) -> dense composition.
 #include "../src/demos/char_rnn.cpp"
+// Include only the MLP struct from the MNIST demo (its CLI main pulls in the
+// MNIST loader / stb_image.h). Checks the real
+// Dense -> ReLU -> Dense -> ReLU -> Dense composition on a tiny model.
+#define SHADE_MLP_NO_MAIN
+#include "../src/demos/mnist_mlp.cpp"
+#undef SHADE_MLP_NO_MAIN
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -431,6 +437,23 @@ int main() {
     ok &= charrnn_loss_gradcheck();
     ok &= charrnn_loss_validation_check();
     ok &= nan_guard_selftests();
+
+    // Kept last: randomize()/random_tensor() advance the shared RNG, so this
+    // test must not shift the numbers reported by the checks above.
+    {
+        // Real MNIST MLP composition from the demo on a tiny model:
+        // Dense -> ReLU -> Dense -> ReLU -> Dense. Input is continuous, so
+        // both parameter and input gradients are checked.
+        MLP model(4, 6, 5, 3);
+        for (auto* p : model.params()) randomize(*p);
+        Tensor x = random_tensor(3, 4);
+        ok &= gradcheck("MLP",
+            [&] { return model.forward(x); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                ig.push_back(model.backward(dout)); // MLP now returns d(input)
+            },
+            model.params(), model.grads(), {&x});
+    }
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");
