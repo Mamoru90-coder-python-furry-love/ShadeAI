@@ -11,6 +11,7 @@
 #include <cstring>
 #include <algorithm>
 #include <fstream>
+#include <stdexcept>
 
 struct TransformerLM {
     i32 vocab_size, dim, num_blocks;
@@ -49,6 +50,24 @@ struct TransformerLM {
     // used to emit unscaled (sum) dlogits while printing the mean loss, so the
     // optimized and reported objectives differed (same issue fixed in CharRNN).
     float compute_loss(const Tensor& logits, const Tensor& targets, Tensor& dlogits) {
+        // Same guards as CharRNN::compute_loss: a wrong logits width, a length
+        // mismatch, or a non-integral / out-of-range target would otherwise
+        // index past the row or divide by zero. Validate the raw float BEFORE
+        // casting: float->int is undefined for NaN, infinities, and values
+        // outside the int range.
+        if (vocab_size <= 0)
+            throw std::invalid_argument("TransformerLM::compute_loss: invalid vocab size");
+        if (logits.cols != vocab_size)
+            throw std::invalid_argument("TransformerLM::compute_loss: invalid logits width");
+        if (logits.rows <= 0 || targets.size() != logits.rows)
+            throw std::invalid_argument("TransformerLM::compute_loss: invalid sequence length");
+        for (i32 i = 0; i < targets.size(); i++) {
+            f32 raw = targets.data[i];
+            if (!std::isfinite(raw) || raw < 0.0f ||
+                raw >= (f32)vocab_size || std::trunc(raw) != raw)
+                throw std::invalid_argument("TransformerLM::compute_loss: invalid target ID");
+        }
+
         i32 T = logits.rows;
         dlogits = Tensor(T, vocab_size, 0.0f);
         float loss = 0;
@@ -188,6 +207,14 @@ void demo_transformer_lm() {
         auto pp = lm.params();
         auto gp = lm.grads();
         opt.zero_grad(gp);
+        // Each window contributes the gradient of its own mean loss; the
+        // accumulated tensors hold their sum. Average before clipping so the
+        // optimizer sees the gradient of the mean reported in `tl`.
+        auto scale_accumulated = [&gp](f32 scale) {
+            for (auto* g : gp)
+                for (i32 i = 0; i < g->size(); i++)
+                    g->data[i] *= scale;
+        };
         float tl = 0;
         int iters = 0;
 
@@ -207,14 +234,17 @@ void demo_transformer_lm() {
             iters_since_step++;
 
             if (iters_since_step >= batch_size) {
+                scale_accumulated(1.0f / (f32)iters_since_step);
                 lm.clip_grads(1.0f);
                 opt.step(pp, gp);
                 opt.zero_grad(gp);
                 iters_since_step = 0;
             }
         }
-        // final step
+        // final step: divide by the actual (possibly partial) group size, not
+        // by the fixed batch_size.
         if (iters_since_step > 0) {
+            scale_accumulated(1.0f / (f32)iters_since_step);
             lm.clip_grads(1.0f);
             opt.step(pp, gp);
             iters_since_step = 0;

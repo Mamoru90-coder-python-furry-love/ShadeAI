@@ -336,6 +336,52 @@ static bool charrnn_loss_validation_check() {
     return ok;
 }
 
+// Mirror of CharRNNVal for the demo's extracted compute_loss. Uses constant
+// logits instead of random_tensor so it cannot shift the shared RNG stream.
+static bool transformer_lm_loss_validation_check() {
+    TransformerLM model(8, 4, 1);
+    Tensor dlogits;
+    bool ok = true;
+    auto rejects = [&](const char* what, const Tensor& logits, const Tensor& targets) {
+        bool threw = false;
+        try { model.compute_loss(logits, targets, dlogits); }
+        catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr, "TransformerLMVal: %s was not rejected\n", what);
+            ok = false;
+        }
+    };
+    Tensor good_logits(5, 8, 0.1f);
+    Tensor good_targets(1, 5);
+    for (i32 i = 0; i < good_targets.cols; i++) good_targets.data[i] = (f32)(i % 8);
+
+    rejects("wrong logits width", Tensor(5, 7, 0.1f), good_targets);
+    rejects("empty sequence", Tensor(), Tensor());
+    rejects("length mismatch", good_logits, Tensor(1, 4));
+
+    Tensor t = good_targets.clone(); t.data[0] = -1.0f;
+    rejects("negative target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 8.0f;
+    rejects("target >= vocab", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 1.5f;
+    rejects("non-integral target", good_logits, t);
+    // Non-finite / huge values must be rejected BEFORE any float->int cast.
+    t = good_targets.clone(); t.data[0] = std::numeric_limits<f32>::quiet_NaN();
+    rejects("NaN target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = std::numeric_limits<f32>::infinity();
+    rejects("+Inf target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = -std::numeric_limits<f32>::infinity();
+    rejects("-Inf target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 1e30f;
+    rejects("huge finite target", good_logits, t);
+
+    // As in CharRNN, the vocab_size > 0 guard is not directly reachable: the
+    // Dense output head rejects a zero output dimension at construction.
+
+    std::printf("%-16s %s\n", "TransformerLMVal", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Regression for the NaN trap: `NaN > worst` is false, so a non-finite
 // gradient used to be able to leave worst at 0 and report a false OK. Probe
 // both paths: a NaN analytic gradient and a NaN numeric (forward) gradient.
@@ -608,6 +654,7 @@ int main() {
             lm.params(), lm.grads(), {});
     }
     ok &= transformer_lm_loss_gradcheck();
+    ok &= transformer_lm_loss_validation_check();
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");
