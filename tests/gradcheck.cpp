@@ -382,6 +382,128 @@ static bool transformer_lm_loss_validation_check() {
     return ok;
 }
 
+// ---------------- CrossEntropyLoss::forward ----------------
+
+static f32 ce_relerr(f32 a, f32 b) {
+    if (!std::isfinite(b)) return std::numeric_limits<f32>::infinity();
+    return std::fabs(a - b) / std::fmax(1.0f, std::fmax(std::fabs(a), std::fabs(b)));
+}
+
+// Independent double-precision evaluation on the exact f32 inputs. Used for
+// large logits, where a finite difference of the f32 loss would be dominated
+// by cancellation instead of measuring the analytic gradient.
+static void cross_entropy_ref(const Tensor& logits, const Tensor& target,
+                              f32& loss, Tensor& grad) {
+    const i32 n = logits.rows, C = logits.cols;
+    grad = Tensor(n, C);
+    double total = 0;
+    for (i32 i = 0; i < n; i++) {
+        double mx = -std::numeric_limits<double>::infinity();
+        for (i32 j = 0; j < C; j++) mx = std::max(mx, (double)logits.at(i, j));
+        std::vector<double> e(C);
+        double sum = 0;
+        for (i32 j = 0; j < C; j++) {
+            e[j] = std::exp((double)logits.at(i, j) - mx);
+            sum += e[j];
+        }
+        for (i32 j = 0; j < C; j++) {
+            f32 t = target.at(i, j);
+            f32 p = (f32)(e[j] / sum);
+            grad.at(i, j) = (p - t) / (f32)n;
+            if (t != 0.0f)
+                total += -(double)t * std::log((double)std::max(p, 1e-7f));
+        }
+    }
+    loss = (f32)(total / n);
+}
+
+static bool cross_entropy_case(const char* label, i32 n, i32 C,
+                               f32 base, f32 spread, bool do_fd) {
+    Tensor logits(n, C), target(n, C, 0.0f);
+    for (i32 i = 0; i < n; i++) {
+        for (i32 j = 0; j < C; j++)
+            logits.at(i, j) = base + spread * std::sin((f32)(i * 13 + j * 7 + 1) * 0.37f);
+        target.at(i, i % C) = 1.0f;
+    }
+
+    Tensor dlogits, scratch;
+    f32 loss = CrossEntropyLoss::forward(logits, target, dlogits);
+    f32 ref_loss;
+    Tensor ref_grad;
+    cross_entropy_ref(logits, target, ref_loss, ref_grad);
+
+    bool finite_ok = std::isfinite(loss) && std::isfinite(ref_loss);
+    f32 worst_ref = ce_relerr(loss, ref_loss);
+    for (i32 k = 0; k < dlogits.size(); k++) {
+        f32 a = dlogits.data[k];
+        if (!std::isfinite(a)) { finite_ok = false; continue; }
+        worst_ref = std::max(worst_ref, ce_relerr(a, ref_grad.data[k]));
+    }
+
+    f32 worst_fd = 0;
+    if (do_fd) {
+        for (i32 k = 0; k < logits.size(); k++) {
+            f32 orig = logits.data[k];
+            logits.data[k] = orig + GRAD_EPS;
+            f32 lp = CrossEntropyLoss::forward(logits, target, scratch);
+            logits.data[k] = orig - GRAD_EPS;
+            f32 lm = CrossEntropyLoss::forward(logits, target, scratch);
+            logits.data[k] = orig;
+            f32 num = (lp - lm) / (2.0f * GRAD_EPS);
+            if (!std::isfinite(num)) { finite_ok = false; continue; }
+            worst_fd = std::max(worst_fd, ce_relerr(num, dlogits.data[k]));
+        }
+    }
+
+    bool ok = finite_ok && worst_ref <= 1e-4f && (!do_fd || worst_fd <= 2e-3f);
+    std::printf("%-16s %s  ref %.3e  fd %.3e%s\n", label, ok ? "OK" : "FAIL",
+                worst_ref, worst_fd, do_fd ? "" : " (ref only)");
+    return ok;
+}
+
+static bool cross_entropy_loss_gradcheck() {
+    struct Case { const char* label; i32 n, C; f32 base, spread; bool fd; };
+    // C = 8/16 hit the AVX path (one/two full blocks); C = 5/7 are scalar-only;
+    // C = 9 mixes a full block with a tail. n varies to exercise 1/n.
+    static const Case cases[] = {
+        {"CE n1 C8",     1,  8,    0.f,   5.f, true},
+        {"CE n3 C5",     3,  5,    0.f,   5.f, true},
+        {"CE n4 C9",     4,  9,    0.f,   5.f, true},
+        {"CE n8 C16",    8, 16,    0.f,   5.f, true},
+        {"CE n2 C7",     2,  7,    0.f,   5.f, true},
+        // Large absolute logits need max-subtraction; a 200-wide spread needs
+        // the exp(-80) AVX clamp / underflow. FD is skipped here: subtracting
+        // two f32 losses of magnitude ~2000 would measure cancellation.
+        {"CE bigbase",   3,  8, 1000.f,   2.f, false},
+        {"CE wide",      3, 16,    0.f, 100.f, false},
+    };
+    bool ok = true;
+    for (const auto& c : cases)
+        ok &= cross_entropy_case(c.label, c.n, c.C, c.base, c.spread, c.fd);
+    return ok;
+}
+
+static bool cross_entropy_validation_check() {
+    bool ok = true;
+    Tensor d;
+    auto rejects = [&](const char* what, const Tensor& logits, const Tensor& target) {
+        bool threw = false;
+        try { CrossEntropyLoss::forward(logits, target, d); }
+        catch (const std::invalid_argument&) { threw = true; }
+        if (!threw) {
+            std::fprintf(stderr, "CEVal: %s was not rejected\n", what);
+            ok = false;
+        }
+    };
+    rejects("empty rows", Tensor(0, 8), Tensor(0, 8));
+    rejects("zero classes", Tensor(3, 0), Tensor(3, 0));
+    rejects("target rows", Tensor(3, 8), Tensor(2, 8));
+    rejects("target cols", Tensor(3, 8), Tensor(3, 7));
+    rejects("empty target", Tensor(3, 8), Tensor());
+    std::printf("%-16s %s\n", "CEVal", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 // Regression for the NaN trap: `NaN > worst` is false, so a non-finite
 // gradient used to be able to leave worst at 0 and report a false OK. Probe
 // both paths: a NaN analytic gradient and a NaN numeric (forward) gradient.
@@ -655,6 +777,8 @@ int main() {
     }
     ok &= transformer_lm_loss_gradcheck();
     ok &= transformer_lm_loss_validation_check();
+    ok &= cross_entropy_loss_gradcheck();
+    ok &= cross_entropy_validation_check();
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");

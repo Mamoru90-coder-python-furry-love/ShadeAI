@@ -71,7 +71,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 
 ```
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense), MNIST MLP (Dense→ReLU→Dense→ReLU→Dense), MNIST CNN (Conv→ReLU→MaxPool ×2→Dense→Dense), TransformerLM (embedding→pos-encoding→2 блоки→dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss, TransformerLMLoss) + валідація входів CharRNN::compute_loss / TransformerLM::compute_loss (CharRNNVal, TransformerLMVal); NaN-guard self-test
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense), MNIST MLP (Dense→ReLU→Dense→ReLU→Dense), MNIST CNN (Conv→ReLU→MaxPool ×2→Dense→Dense), TransformerLM (embedding→pos-encoding→2 блоки→dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss, TransformerLMLoss) + окремий CrossEntropyLoss::forward (AVX-гілка, різні n/C, double-еталон, великі logits; CE) + валідація входів CharRNN::compute_loss / TransformerLM::compute_loss / CrossEntropyLoss::forward (CharRNNVal, TransformerLMVal, CEVal); NaN-guard self-test
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
 tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
@@ -103,6 +103,14 @@ CharRNNLoss     OK  worst rel err 1.44e-04
 TransformerLMLoss OK worst rel err 1.22e-04
 CharRNNVal       OK
 TransformerLMVal OK
+CE n1 C8         OK  ref 7.29e-08  fd 1.44e-04
+CE n3 C5         OK  ref 6.35e-08  fd 9.05e-05
+CE n4 C9         OK  ref 6.23e-08  fd 1.15e-04
+CE n8 C16        OK  ref 9.50e-08  fd 1.91e-04
+CE n2 C7         OK  ref 6.11e-08  fd 6.78e-05
+CE bigbase       OK  ref 2.98e-08 (ref only)
+CE wide          OK  ref 9.78e-09 (ref only)
+CEVal            OK
 ```
 
 ### Виправлені математичні помилки
@@ -149,7 +157,7 @@ TransformerLMVal OK
 
 #### Gradient checking — P2
 
-`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` і `CharRNNLoss` звіряють `dlogits` із `GPT::compute_loss` / `CharRNN::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss. Обидва loss-харнеси мають тотожний NaN-guard, що й загальний `gradcheck`. Також перевірено **MNIST MLP** — реальну композицію `Dense → ReLU → Dense → ReLU → Dense` з демо `mnist_mlp.cpp` (6 груп параметрів + градієнт по входу), **MNIST CNN** — реальну композицію `Conv → ReLU → MaxPool ×2 → Dense → Dense` з демо `mnist_cnn.cpp` (8 груп параметрів + градієнт по входу), та **TransformerLM** — реальну композицію `Embedding → PositionalEncoding → TransformerBlock ×2 → Dense` з демо `transformer_lm.cpp` (15 груп параметрів; входи дискретні). `TransformerLMLoss` окремо звіряє `dlogits` із новим `TransformerLM::compute_loss`, а `TransformerLMVal` перевіряє ті самі 10 видів некоректного вводу, що й `CharRNNVal` (детерміновані дані, без споживання RNG). Демо `transformer_test.cpp` не додає нової композиції — там лише `TransformerBlock → Dense`, уже покрите окремо.
+`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` і `CharRNNLoss` звіряють `dlogits` із `GPT::compute_loss` / `CharRNN::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss. Обидва loss-харнеси мають тотожний NaN-guard, що й загальний `gradcheck`. Також перевірено **MNIST MLP** — реальну композицію `Dense → ReLU → Dense → ReLU → Dense` з демо `mnist_mlp.cpp` (6 груп параметрів + градієнт по входу), **MNIST CNN** — реальну композицію `Conv → ReLU → MaxPool ×2 → Dense → Dense` з демо `mnist_cnn.cpp` (8 груп параметрів + градієнт по входу), та **TransformerLM** — реальну композицію `Embedding → PositionalEncoding → TransformerBlock ×2 → Dense` з демо `transformer_lm.cpp` (15 груп параметрів; входи дискретні). `TransformerLMLoss` окремо звіряє `dlogits` із новим `TransformerLM::compute_loss`, а `TransformerLMVal` перевіряє ті самі 10 видів некоректного вводу, що й `CharRNNVal` (детерміновані дані, без споживання RNG). Окремо додано `CrossEntropyLoss::forward` — див. розділ нижче. Демо `transformer_test.cpp` не додає нової композиції — там лише `TransformerBlock → Dense`, уже покрите окремо.
 
 
 `gpt.cpp` включається в тест з `#define main gpt_cli_main`, тобто перевіряється **реальна** композиція моделі, а не її копія. Градієнти, що накопичуються (`Dense/Attention/Embedding` через `+=`), коректно обнуляються харнесом перед єдиним аналітичним `backward`; числові `forward()` під час sweep не пишуть у градієнти. Тренувальний цикл (`opt.zero_grad` на початку епохи й після `opt.step`) перевірено окремо — накопичення між мікро-батчами є навмисним і далі ділиться на `iters_since_step`.
@@ -210,11 +218,21 @@ Embedding використовує послідовність із **повто�
 
 **Валідація `TransformerLM::compute_loss` (виправлено там само).** Перенесено guard-и з `CharRNN::compute_loss`: `vocab_size > 0`, ширина logits, непорожня послідовність, `targets.size() == logits.rows`, а raw `f32` target перевіряється **до** `(int)` — `isfinite`, діапазон `0 ≤ raw < vocab_size` і `trunc(raw) == raw`. Новий харнес `TransformerLMVal` відхиляє ті самі 10 видів вводу, що й `CharRNNVal`, на детермінованих даних (без споживання RNG, тому попередні числа не зсунулись). Guard `vocab_size > 0` лишився захисним і, як і в CharRNN, не тестується напряму: `Dense` у head-і відкидає нульову вихідну розмірність ще на конструкції.
 
-Наступний кандидат — окремий `CrossEntropyLoss::forward` (використовується в MLP/CNN і в `main.cpp`, але ще не має власного gradcheck).
+#### Gradient checking CrossEntropyLoss::forward — P2 (завершення)
+
+`CrossEntropyLoss` — спільний loss для `main.cpp`, MNIST MLP/CNN; до цього перевірявся лише побічно (simd_check порівнює AVX із scalar-еталоном для `n=3, C=19`). Новий харнес у `tests/gradcheck.cpp` перевіряє його напряму:
+
+- **finite differences** з `eps=1e-3` для `(n,C)` = `(1,8)`, `(3,5)`, `(4,9)`, `(8,16)`, `(2,7)` — тобто `C` кратне 8 (AVX: один/два блоки), `C < 8` (scalar-only) і `C = 9` (AVX-блок + scalar-хвіст); batch 1..8 перевіряє ділення на `n`. Найгірша FD-похибка **1.91e-04** (поріг `2e-3`).
+- **незалежний double-еталон** на тих самих f32-входах для всіх кейсів; найгірша похибка **9.50e-08** (поріг `1e-4`). Еталон особливо потрібний для `base=1000` (перевірка віднімання максимуму) і `spread=100` (exp-clamp/underflow): там скінченна різниця f32-loss вимірювала б переважно помилку округлення при відніманні двох великих значень, а не градієнт, тому FD для них пропущено.
+- **one-hot targets** рядкової форми `n×C`, як і в усіх реальних викликах.
+
+**Guard-и розмірів у `CrossEntropyLoss::forward` (додано).** Раніше порожній batch ділив на нуль, а target з іншою формою читав поза своїм сховищем за адресою `i*C + j`. Додано `n > 0`, `C > 0` і `target.rows/cols == logits.rows/cols` через `std::invalid_argument`. `CEVal` відхиляє 5 випадків: порожні рядки, нуль класів, розсинхрон рядків/стовпців target і порожній target. Математика loss/градієнта не змінена.
+
+Наступні кандидати — лише P3-нотатки (можливий MaxPool tie-gap guard за іншого seed/config і порівняння `(f32)vocab_size` через `double`), якщо з'явиться підтвердження на даних.
 
 ### Ще не зроблено
 
-- Gradient checking покриває GPT, char-RNN, MNIST MLP, MNIST CNN і TransformerLM, але не покриває окремо `CrossEntropyLoss::forward`.
+- Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
 - Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
 

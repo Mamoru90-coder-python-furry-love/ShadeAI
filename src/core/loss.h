@@ -2,11 +2,19 @@
 #include "tensor.h"
 #include "simd.h"
 #include <cmath>
+#include <stdexcept>
 
 struct CrossEntropyLoss {
     // softmax + cross entropy, returns dlogits for backward
     static f32 forward(const Tensor& logits, const Tensor& target, Tensor& dlogits) {
         const i32 n = logits.rows, C = logits.cols;
+        // target is a one-hot tensor with the same shape as logits. Without
+        // these guards an empty batch divides by zero and a mismatched target
+        // reads past its storage at row i * C + j.
+        if (n <= 0 || C <= 0)
+            throw std::invalid_argument("CrossEntropyLoss::forward: empty logits");
+        if (target.rows != n || target.cols != C)
+            throw std::invalid_argument("CrossEntropyLoss::forward: target shape mismatch");
         dlogits = Tensor(n, C);
         f32 loss = 0;
         for (i32 i = 0; i < n; i++) {
