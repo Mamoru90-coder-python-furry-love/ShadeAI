@@ -13,6 +13,9 @@
 #define main gpt_cli_main
 #include "../src/gpt.cpp"
 #undef main
+// The char-RNN demo has no main, so it can be included directly to check the
+// real embedding -> GRU (BPTT) -> dense composition.
+#include "../src/demos/char_rnn.cpp"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -318,6 +321,21 @@ int main() {
             [&] { return gpt.forward(ids); },
             [&](const Tensor& dout, std::vector<Tensor>&) { gpt.backward(dout, ids); },
             gpt.params(), gpt.grads(), {});
+    }
+
+    {
+        // Real char-RNN composition from the demo: embedding -> GRU over the
+        // sequence -> dense head. Token ids are discrete, so only parameter
+        // gradients are compared; GRU's BPTT path is covered through the model.
+        CharRNN model(8, 4, 6);
+        for (auto* p : model.params()) randomize(*p);
+        Tensor ids(1, 5);
+        const f32 seq[] = { 0, 1, 0, 2, 3 };
+        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = seq[i];
+        ok &= gradcheck("CharRNN",
+            [&] { return model.forward(ids); },
+            [&](const Tensor& dout, std::vector<Tensor>&) { model.backward(dout, ids); },
+            model.params(), model.grads(), {});
     }
 
     ok &= gpt_loss_gradcheck();
