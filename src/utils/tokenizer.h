@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <utility>
 
 struct Tokenizer {
     std::unordered_map<std::string, int> word2id;
@@ -89,25 +90,50 @@ struct Tokenizer {
         return result;
     }
 
+    // Raw binary I/O so the vocabulary can be embedded in a model checkpoint.
+    // Bounds are checked: a corrupt file must not trigger huge allocations.
+    bool write(FILE* f) const {
+        if (!f) return false;
+        i32 n = (i32)id2word.size();
+        if (fwrite(&n, sizeof(i32), 1, f) != 1) return false;
+        for (const auto& w : id2word) {
+            i32 len = (i32)w.size();
+            if (fwrite(&len, sizeof(i32), 1, f) != 1) return false;
+            if (len > 0 && fwrite(w.data(), 1, (size_t)len, f) != (size_t)len) return false;
+        }
+        return true;
+    }
+
+    bool read(FILE* f) {
+        if (!f) return false;
+        i32 n;
+        if (fread(&n, sizeof(i32), 1, f) != 1 || n < 0 || n > 1000000) return false;
+        std::vector<std::string> words;
+        words.reserve((size_t)n);
+        for (i32 i = 0; i < n; i++) {
+            i32 len;
+            if (fread(&len, sizeof(i32), 1, f) != 1 || len < 0 || len > (1 << 20)) return false;
+            std::string w((size_t)len, '\0');
+            if (len > 0 && fread(&w[0], 1, (size_t)len, f) != (size_t)len) return false;
+            words.push_back(std::move(w));
+        }
+        id2word = std::move(words);
+        word2id.clear();
+        for (i32 i = 0; i < n; i++) word2id[id2word[(size_t)i]] = i;
+        vocab_size = n;
+        return true;
+    }
+
     bool save(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb"); if (!f) return false;
-        i32 n = (i32)id2word.size(); fwrite(&n, sizeof(i32), 1, f);
-        for (auto& w : id2word) {
-            i32 len = (i32)w.size(); fwrite(&len, sizeof(i32), 1, f);
-            fwrite(w.data(), 1, len, f);
-        }
-        fclose(f); return true;
+        bool ok = write(f);
+        return fclose(f) == 0 && ok;
     }
 
     bool load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb"); if (!f) return false;
-        i32 n; fread(&n, sizeof(i32), 1, f);
-        id2word.resize(n); word2id.clear();
-        for (i32 i = 0; i < n; i++) {
-            i32 len; fread(&len, sizeof(i32), 1, f);
-            std::string w(len, '\0'); fread(&w[0], 1, len, f);
-            id2word[i] = w; word2id[w] = i;
-        }
-        vocab_size = n; fclose(f); return true;
+        bool ok = read(f);
+        if (ok && fgetc(f) != EOF) ok = false; // reject trailing garbage
+        return fclose(f) == 0 && ok;
     }
 };

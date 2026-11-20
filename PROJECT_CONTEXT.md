@@ -37,12 +37,16 @@ src/gpt.cpp  ->  build/shade.exe
 Актуальний CLI:
 
 ```
-build\shade.exe                         # train: data/tinystories_valid.txt -> gpt_model.bin
-build\shade.exe --load <model.bin> "prompt"
+build\shade.exe                                        # train: data/tinystories_valid.txt -> gpt_model.bin
+build\shade.exe --train [data.txt] [model.bin]          # train з явними шляхами
+build\shade.exe --load <model.bin> "prompt"             # inference
+build\shade.exe --load <model.bin> --prompt "prompt"    # inference (еквівалентно)
 ```
 
-`--train` поки **не парситься** — якщо не передано `--load`, програма завжди запускає тренування.
-`--load` вимагає шлях до моделі **і** prompt.
+Checkpoint тепер **самостійний**: magic/version + конфіг (`vocab/dim/blocks/ctx`) + tokenizer + ваги.
+Тому `--load` відбудовує архітектуру й словник без навчального тексту. Старі формати (лише ваги) відхиляються з повідомленням.
+
+Поточний навчальний конфіг у коді: `dim=64`, `blocks=3`, `max_len=32`, `vocab` будується з тексту (до 2000 токенів). `train_config.json` не читається.
 
 ### Ядро
 
@@ -55,8 +59,9 @@ build\shade.exe --load <model.bin> "prompt"
 | `src/layers/attention.h` | causal self-attention, SIMD QKᵀ/softmax/score·V |
 | `src/layers/transformer.h` | TransformerBlock, виправлений sinusoidal positional encoding |
 | `src/layers/layernorm.h`, `dense.h`, `gru.h` | шари з backward |
-| `src/utils/serialize.h` | SHDE checkpoint, перевірка `fread`, NaN/Inf |
-| `src/utils/tokenizer_bpe.h` | власний BPE tokenizer |
+| `src/utils/serialize.h` | SHDE checkpoint, транзакційне читання, перевірка `fread`/NaN/Inf |
+| `src/utils/tokenizer.h` | словниковий tokenizer, бінарне збереження у checkpoint |
+| `src/utils/tokenizer_bpe.h` | окремий BPE tokenizer (не використовується в `gpt.cpp`) |
 
 ---
 
@@ -65,11 +70,12 @@ build\shade.exe --load <model.bin> "prompt"
 ### Тести
 
 ```
-tests/simd_check.cpp     — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp      — central finite differences для Dense/LayerNorm/GRU/Attention, включно з h0
+tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention, включно з h0
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
-tests/tensor_checks.cpp  — runtime перевірки навіть при /DNDEBUG
-tests/bench.cpp          — scalar vs AVX: matmul/attention/AdamW
+tests/gpt_checkpoint_check.cpp — round-trip GPT checkpoint + інтеграційний inference-шлях
+tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
+tests/bench.cpp            — scalar vs AVX: matmul/attention/AdamW
 ```
 
 Зручна перевірка всього:
@@ -100,12 +106,13 @@ Attention    OK  worst rel err 2.55e-05
 - Serialization: транзакційне завантаження — спершу читання в тимчасові буфери, потім перевірка всього файлу (включно з EOF) і тільки тоді заміна ваг. Відхиляються обрізані, NaN/отруєні, з зайвими байтами, з неправильною кількістю/формою параметрів файли. Те саме для optimizer state.
 - `Tensor::slice()`: перевірка `start + count` без переповнення.
 - Перевірки параметрів конструкторів і форм входу в Dense/LayerNorm/GRU/Attention/Transformer.
+- GPT checkpoint: конфіг + tokenizer + ваги в одному файлі; `--load` відбудовує модель і генерує текст. `sample()` більше не має фіксованого буфера на 16384 токени.
 
 ### Ще не зроблено
 
-- `--load` у `gpt.cpp` все ще заглушка: потрібно зберегти/відновлювати tokenizer разом із моделлю й реалізувати повний inference.
 - Gradient checking не покриває весь TransformerBlock/Embedding/GRU в складі GPT.
 - Атомарний запис checkpoint-ів (temp file + rename) поки не реалізований; транзакційне **читання** вже є.
+- `train_config.json` не читається — конфіг зашитий у `gpt.cpp`.
 
 ---
 
@@ -123,7 +130,7 @@ Attention    OK  worst rel err 2.55e-05
 1. `git log -5 --oneline`.
 2. Прочитати цей файл і `PLAN.md`.
 3. Зібрати: `build\compile.bat`.
-4. Прогнати: `simd_check`, `gradcheck`, `tensor_checks`, `demos`.
+4. Прогнати: `build\test.bat` (simd_check, gradcheck, serialize_checks, gpt_checkpoint_check, tensor_checks, demos).
 5. Не додавати нові архітектури, доки gradient checking не покриє решту шарів і TransformerBlock повністю.
 
 ---

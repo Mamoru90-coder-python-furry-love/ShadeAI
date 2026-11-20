@@ -14,6 +14,7 @@
 #include <cstring>
 #include <ctime>
 #include <cstdlib>
+#include <memory>
 
 struct GPT {
     i32 vocab_size, dim, num_blocks, max_len;
@@ -111,14 +112,14 @@ struct GPT {
         for (int j = 1; j < n; j++)
             if (logits[j] > maxv) maxv = logits[j];
         float sum = 0;
-        float probs[16384];
+        std::vector<float> probs((size_t)n); // vocab-dependent: no fixed-size overflow
         for (int j = 0; j < n; j++) {
             probs[j] = expf((logits[j] - maxv) / fmaxf(temp, 0.01f));
             sum += probs[j];
         }
         if (top_k > 0 && top_k < n) {
             float threshold = 0;
-            std::vector<float> sorted(probs, probs + n);
+            std::vector<float> sorted(probs);
             std::sort(sorted.begin(), sorted.end(), std::greater<float>());
             threshold = sorted[std::min(top_k, n - 1)];
             float filtered_sum = 0;
@@ -154,6 +155,78 @@ struct GPT {
         return tok.decode(ids);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Self-contained GPT checkpoint: magic/version + config + tokenizer + weights.
+// Reuses the validated block I/O from Serialize::detail so a corrupt file is
+// rejected without ever touching a live model.
+// ---------------------------------------------------------------------------
+static constexpr i32 GPT_MAGIC = 0x53484447; // "SHDG"
+static constexpr i32 GPT_VERSION = 1;
+
+struct GPTConfig { i32 vocab, dim, blocks, max_len; };
+
+bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
+    using namespace Serialize::detail;
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = true;
+    auto wi = [&](i32 v) { if (ok) ok = write_i32(f, v); };
+
+    wi(GPT_MAGIC);
+    wi(GPT_VERSION);
+    wi(gpt.vocab_size);
+    wi(gpt.dim);
+    wi(gpt.num_blocks);
+    wi(gpt.max_len);
+    if (ok) ok = tok.write(f); // tokenizer vocabulary
+
+    auto params = gpt.params();
+    wi((i32)params.size());
+    for (auto* p : params) {
+        if (!ok) break;
+        ok = write_tensor(f, *p);
+    }
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
+                         Tokenizer& tok, std::vector<Tensor>& weights) {
+    using namespace Serialize::detail;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = false;
+    do {
+        i32 magic, ver;
+        if (!read_i32(f, magic) || !read_i32(f, ver)) break;
+        if (magic != GPT_MAGIC || ver != GPT_VERSION) break;
+        if (!read_i32(f, cfg.vocab) || !read_i32(f, cfg.dim) ||
+            !read_i32(f, cfg.blocks) || !read_i32(f, cfg.max_len)) break;
+
+        // Reject absurd values before they turn into allocations or loops.
+        if (cfg.vocab < Tokenizer::SPECIAL || cfg.vocab > 1000000) break;
+        if (cfg.dim < 1 || cfg.dim > 65536) break;
+        if (cfg.blocks < 1 || cfg.blocks > 1024) break;
+        if (cfg.max_len < 1 || cfg.max_len > 1000000) break;
+
+        if (!tok.read(f) || tok.vocab_size != cfg.vocab) break;
+
+        i32 nt;
+        if (!read_i32(f, nt) || nt < 1 || nt > 10000) break;
+        weights.clear();
+        weights.reserve((size_t)nt);
+        for (i32 i = 0; i < nt; i++) {
+            Tensor t;
+            if (!read_tensor(f, t)) break;
+            weights.push_back(std::move(t));
+        }
+        if ((i32)weights.size() != nt || !at_eof(f)) break;
+        ok = true;
+    } while (false);
+    fclose(f);
+    return ok;
+}
 
 void train_gpt(const std::string& data_path, const std::string& model_path) {
     printf("=== GPT-2 Mini ===\n");
@@ -247,13 +320,12 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
         fflush(stdout);
     }
 
-    // Save model
-    {
-        std::vector<Tensor*> tensors;
-        for (auto* p : gpt.params()) tensors.push_back(p);
-        Serialize::save(model_path, tensors);
-        printf("  model saved to %s\n", model_path.c_str());
+    // Save a self-contained checkpoint (config + tokenizer + weights).
+    if (!save_gpt(model_path, gpt, tok)) {
+        printf("  ERROR: failed to save model to %s\n", model_path.c_str());
+        return;
     }
+    printf("  model saved to %s\n", model_path.c_str());
 
     printf("\n  --- final generation ---\n");
     const char* prompts[] = {"once upon a time", "the robot", "hello", nullptr};
@@ -266,24 +338,78 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
 
 void infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     printf("Loading %s ...\n", model_path.c_str());
-    // Load model config from file header
-    // For now we need to hardcode or infer — let's load and check shapes
-    // Actually, we need the tokenizer too. Let's keep it simple: just train for now.
-    printf("Inference mode coming soon. Train first.\n");
+
+    GPTConfig cfg;
+    Tokenizer tok;
+    std::vector<Tensor> weights;
+    if (!read_gpt_checkpoint(model_path, cfg, tok, weights)) {
+        printf("ERROR: cannot load checkpoint (missing, corrupt, or old-format file).\n");
+        printf("       Train first with: shade.exe --train <data.txt> <model.bin>\n");
+        return;
+    }
+    printf("  config: vocab=%d dim=%d blocks=%d ctx=%d\n",
+           cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+
+    auto gpt = std::make_unique<GPT>(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+    auto params = gpt->params();
+    if ((i32)params.size() != (i32)weights.size()) {
+        printf("ERROR: checkpoint weight count mismatch (%zu vs %zu)\n",
+               params.size(), weights.size());
+        return;
+    }
+    for (size_t i = 0; i < params.size(); i++) {
+        if (params[i]->rows != weights[i].rows || params[i]->cols != weights[i].cols) {
+            printf("ERROR: checkpoint weight %zu has shape %dx%d, expected %dx%d\n",
+                   i, weights[i].rows, weights[i].cols, params[i]->rows, params[i]->cols);
+            return;
+        }
+        params[i]->data = std::move(weights[i].data);
+    }
+
+    // Seed with BOS + prompt tokens. No EOS: the model should continue the text.
+    std::vector<int> seed;
+    seed.push_back(Tokenizer::BOS);
+    for (const auto& t : tok.tokenize(prompt_text)) {
+        auto it = tok.word2id.find(t);
+        seed.push_back(it != tok.word2id.end() ? it->second : Tokenizer::UNK);
+    }
+    if (seed.size() == 1) seed.push_back(Tokenizer::UNK); // empty prompt fallback
+
+    srand((unsigned)time(nullptr));
+    std::string out = gpt->generate(seed, 120, 0.8f, 40, tok);
+    printf("\n%s\n", out.c_str());
 }
 
 int main(int argc, char** argv) {
-    // CLI: gpt.exe [--train data.txt model.bin | --load model.bin --prompt "text"]
     std::string data_path = "data/tinystories_valid.txt";
     std::string model_path = "gpt_model.bin";
+    std::string prompt;
     bool train = true;
-    std::string prompt = "";
+    bool load_seen = false;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--load") == 0 && i + 2 < argc) {
-            model_path = argv[++i];
-            prompt = argv[++i];
+        std::string a = argv[i];
+        if (a == "--train") {
+            train = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') data_path = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != '-') model_path = argv[++i];
+        } else if (a == "--load") {
             train = false;
+            load_seen = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') model_path = argv[++i];
+        } else if (a == "--prompt" || a == "--data" || a == "--model") {
+            if (i + 1 < argc) {
+                if (a == "--prompt") prompt = argv[++i];
+                else if (a == "--data") data_path = argv[++i];
+                else model_path = argv[++i];
+            }
+        } else if (!a.empty() && a[0] != '-' && load_seen && prompt.empty()) {
+            prompt = a; // positional prompt, e.g. --load model.bin "hello"
+        } else {
+            printf("Unknown argument: %s\n"
+                   "Usage: shade.exe [--train [data.txt] [model.bin] |\n"
+                   "                  --load <model.bin> [--prompt] \"text\"]\n", a.c_str());
+            return 1;
         }
     }
 
