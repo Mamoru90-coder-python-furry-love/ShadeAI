@@ -33,6 +33,36 @@ struct CharRNN {
         embed.backward(dx, ids);
     }
 
+    // Mean cross-entropy over the sequence. dlogits is scaled by 1/T, so the
+    // gradient corresponds to the returned loss (same convention as
+    // GPT::compute_loss). Callers accumulating several windows must then
+    // average over the window count before clipping/stepping.
+    float compute_loss(const Tensor& logits, const Tensor& targets, Tensor& dlogits) {
+        i32 T = logits.rows;
+        dlogits = Tensor(T, vocab_size, 0.0f);
+        float loss = 0;
+        for (i32 i = 0; i < T; i++) {
+            int tgt = (int)targets.data[i];
+            const float* lp = &logits.data[i * vocab_size];
+            float maxv = lp[0];
+            for (i32 j = 1; j < vocab_size; j++)
+                if (lp[j] > maxv) maxv = lp[j];
+            float sum = 0;
+            float* dp = &dlogits.data[i * vocab_size];
+            for (i32 j = 0; j < vocab_size; j++) {
+                float e = expf(lp[j] - maxv);
+                dp[j] = e;
+                sum += e;
+            }
+            float inv = 1.0f / sum;
+            loss -= logf(fmaxf(dp[tgt] * inv, 1e-10f));
+            float gscale = inv / T;
+            for (i32 j = 0; j < vocab_size; j++)
+                dp[j] = dp[j] * gscale - (j == tgt ? 1.0f / T : 0.0f);
+        }
+        return loss / T;
+    }
+
     // Clip gradients to [-max_norm, max_norm]
     void clip_grads(float max_norm) {
         float norm = 0;
@@ -145,29 +175,19 @@ void demo_charrnn() {
             }
 
             Tensor logits = model.forward(ids);
-            Tensor dlogits(seq_len, vocab_size, 0.0f);
-            float loss = 0;
-            for (int i = 0; i < seq_len; i++) {
-                int tgt = (int)targets.data[i];
-                float maxv = logits.at(i, 0);
-                for (int j = 1; j < vocab_size; j++)
-                    if (logits.at(i, j) > maxv) maxv = logits.at(i, j);
-                float sum = 0;
-                for (int j = 0; j < vocab_size; j++) {
-                    float e = expf(logits.at(i, j) - maxv);
-                    dlogits.at(i, j) = e / 1.0f; // store softmax output scaled
-                    sum += e;
-                }
-                for (int j = 0; j < vocab_size; j++) {
-                    float p = expf(logits.at(i, j) - maxv) / sum;
-                    dlogits.at(i, j) = p - (j == tgt ? 1.0f : 0.0f);
-                }
-                float p_correct = expf(logits.at(i, tgt) - maxv) / sum;
-                loss -= logf(fmaxf(p_correct, 1e-10f));
-            }
-            total_loss += loss / seq_len;
+            Tensor dlogits;
+            total_loss += model.compute_loss(logits, targets, dlogits);
             model.backward(dlogits, ids);
         }
+
+        // compute_loss already scales each window to a mean over tokens;
+        // average the accumulated gradients over the windows as well, so the
+        // optimizer sees the gradient of the printed mean loss. Do this BEFORE
+        // clipping: clipping a sum-of-tokens gradient changes the update.
+        float grad_scale = 1.0f / (f32)std::max(1, iters);
+        for (auto* g : gp)
+            for (int i = 0; i < g->size(); i++)
+                g->data[i] *= grad_scale;
 
         model.clip_grads(1.0f);
         opt.step(pp, gp);

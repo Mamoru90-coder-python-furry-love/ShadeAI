@@ -187,6 +187,47 @@ static bool gpt_loss_gradcheck() {
     return ok;
 }
 
+// CharRNN's training loop used to emit unscaled (sum) dlogits while reporting
+// a mean loss. Check the extracted compute_loss the same way as GPTLoss.
+static bool charrnn_loss_gradcheck() {
+    CharRNN model(8, 4, 6);
+    Tensor logits = random_tensor(5, 8);
+    Tensor targets(1, 5);
+    for (i32 i = 0; i < targets.cols; i++) targets.data[i] = (f32)(i % 8);
+    Tensor scratch(5, 8), dlogits(5, 8);
+    model.compute_loss(logits, targets, dlogits);
+
+    const f32 eps = 1e-3f;
+    f32 worst = 0;
+    bool finite_ok = true;
+    for (i32 i = 0; i < logits.size(); i++) {
+        f32 orig = logits.data[i];
+        logits.data[i] = orig + eps;
+        f32 lp = model.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig - eps;
+        f32 lm = model.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig;
+        f32 num = (lp - lm) / (2.0f * eps);
+        f32 a = dlogits.data[i];
+        if (!std::isfinite(num) || !std::isfinite(a)) {
+            std::fprintf(stderr, "CharRNNLoss: non-finite gradient at logit %d (numeric=%g, analytic=%g)\n",
+                         i, (double)num, (double)a);
+            finite_ok = false;
+            continue;
+        }
+        f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
+        if (!std::isfinite(err)) {
+            std::fprintf(stderr, "CharRNNLoss: non-finite error at logit %d\n", i);
+            finite_ok = false;
+            continue;
+        }
+        if (err > worst) worst = err;
+    }
+    bool ok = finite_ok && worst <= 2e-3f;
+    std::printf("%-12s %s  worst rel err %.3e\n", "CharRNNLoss", ok ? "OK" : "FAIL", worst);
+    return ok;
+}
+
 // Regression for the NaN trap: `NaN > worst` is false, so a non-finite
 // gradient used to be able to leave worst at 0 and report a false OK. Probe
 // both paths: a NaN analytic gradient and a NaN numeric (forward) gradient.
@@ -339,6 +380,7 @@ int main() {
     }
 
     ok &= gpt_loss_gradcheck();
+    ok &= charrnn_loss_gradcheck();
     ok &= nan_guard_selftests();
 
     if (!ok) {

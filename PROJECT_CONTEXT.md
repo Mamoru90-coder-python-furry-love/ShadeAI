@@ -71,7 +71,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 
 ```
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense) + cross-entropy dlogits; NaN-guard self-test
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss); NaN-guard self-test
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
 tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
@@ -141,21 +141,29 @@ GPTLoss         OK  worst rel err 1.72e-04
 
 #### Gradient checking — P2
 
-`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` звіряє `dlogits` із `GPT::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss.
+`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` і `CharRNNLoss` звіряють `dlogits` із `GPT::compute_loss` / `CharRNN::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss. Обидва loss-харнеси мають тотожний NaN-guard, що й загальний `gradcheck`.
 
 `gpt.cpp` включається в тест з `#define main gpt_cli_main`, тобто перевіряється **реальна** композиція моделі, а не її копія. Градієнти, що накопичуються (`Dense/Attention/Embedding` через `+=`), коректно обнуляються харнесом перед єдиним аналітичним `backward`; числові `forward()` під час sweep не пишуть у градієнти. Тренувальний цикл (`opt.zero_grad` на початку епохи й після `opt.step`) перевірено окремо — накопичення між мікро-батчами є навмисним і далі ділиться на `iters_since_step`.
 
 Embedding використовує послідовність із **повторюваними ID** (`0,1,0,2,1,0,3,1,4,5,6,7`), щоб перевірити накопичення градієнта в `gw` для одного токена; усі рядки vocab присутні.
 
-**NaN-guard.** Порівняння `NaN > worst` повертає `false`, тож без явної перевірки нечисловий градієнт міг би непомітно лишити `worst = 0` і дати хибний `OK`. Харнес (`gradcheck` і `gpt_loss_gradcheck`) тепер має `finite_ok` і перевіряє `std::isfinite(num)`, `std::isfinite(a)` та `std::isfinite(err)`; будь-яка нечислова величина друкує діагностику й робить результат `FAIL`. Регресійний self-test (`nan_guard_selftests`) підсовує NaN в аналітичний і в числовий градієнт окремо — обидва мають бути відхилені. Sentinel вимагає саме причини відмови: `expect_fail` повертає `!ok && nonfinite_seen`, тож відмова з будь-якої іншої причини не зараховується. Емпірично перевірено двічі: (1) з тимчасово вимкненою перевіркою `isfinite` обидва sentinel-и друкують `not rejected` і тест падає з `exit=1`; (2) якщо прибрати лише встановлення `nonfinite_seen` (залишивши `finite_ok = false`), sentinel-и знову падають — тобто вони справді перевіряють причину, а не просто факт відмови. З повним кодом обидва проходять тихо.
+**NaN-guard.** Порівняння `NaN > worst` повертає `false`, тож без явної перевірки нечисловий градієнт міг би непомітно лишити `worst = 0` і дати хибний `OK`. Харнеси (`gradcheck`, `gpt_loss_gradcheck`, `charrnn_loss_gradcheck`) тепер мають `finite_ok` і перевіряють `std::isfinite(num)`, `std::isfinite(a)` та `std::isfinite(err)`; будь-яка нечислова величина друкує діагностику й робить результат `FAIL`. Регресійний self-test (`nan_guard_selftests`) підсовує NaN в аналітичний і в числовий градієнт окремо — обидва мають бути відхилені. Sentinel вимагає саме причини відмови: `expect_fail` повертає `!ok && nonfinite_seen`, тож відмова з будь-якої іншої причини не зараховується. Емпірично перевірено двічі: (1) з тимчасово вимкненою перевіркою `isfinite` обидва sentinel-и друкують `not rejected` і тест падає з `exit=1`; (2) якщо прибрати лише встановлення `nonfinite_seen` (залишивши `finite_ok = false`), sentinel-и знову падають — тобто вони справді перевіряють причину, а не просто факт відмови. З повним кодом обидва проходять тихо.
 
-Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 9.90e-06, TransformerBlock 2.68e-05, GPT 3.48e-05, GPTLoss 1.72e-04 — усі нижче порогу.
+Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 9.90e-06, TransformerBlock 2.68e-05, GPT 3.48e-05, CharRNN 3.43e-05, GPTLoss 1.60e-04, CharRNNLoss 1.44e-04 — усі нижче порогу.
 
 #### Gradient checking char-RNN — P2 (продовження)
 
 `tests/gradcheck.cpp` підключає `src/demos/char_rnn.cpp` напряму (у демо немає `main`), тому перевіряється **реальна** композиція `CharRNN::forward/backward`: `Embedding → GRU (BPTT по всій послідовності) → Dense`. Конфіг 8 vocab / embed 4 / hidden 6 / seq 5, 12 груп параметрів (`embed.w`, `fc.w`, `fc.b`, 9 GRU-матриць/ biases), повторювані ID у послідовності. Входи дискретні → лише параметри. Найгірша відносна похибка 3.43e-05. Разом із GPT це вже дві архітектури ShadeAI з перевіреними градієнтами.
 
-**Спостереження (не виправлялось у цьому коміті):** у навчальному циклі `demo_charrnn()` (рядки з обчисленням `dlogits`) градієнт cross-entropy рахується як `p - onehot` **без** ділення на `seq_len`, тоді як `total_loss` ділиться на `seq_len`. Тобто оптимізується сума CE за послідовність, а друкується середня — на відміну від `GPT::compute_loss`, де масштабування `1/T` є в обох. Практично це згладжується `clip_grads(1.0f)` + AdamW, але це розузгодження варто виправити окремо, якщо потрібна точна відповідність друкованого loss до цілі оптимізації.
+#### Нормалізація loss/градієнта в CharRNN (виправлено)
+
+Раніше в навчальному циклі `demo_charrnn()` градієнт cross-entropy був `p - onehot` **без** `/seq_len` (сума CE), а друкуваний `total_loss` ділився на `seq_len` (середнє) — оптимізувалась одна ціль, друкувалась інша. Це впливало на `clip_grads(1.0f)`, бо масштаб суми відрізнявся від масштабу середнього. Виправлено окремим комітом:
+
+- додано `CharRNN::compute_loss(logits, targets, dlogits)` за аналогією з `GPT::compute_loss`: повертає **середню** CE по токенах і пише `dlogits = (p - onehot)/T`, тобто градієнт саме повернутого mean-loss;
+- навчальний цикл тепер викликає `compute_loss` замість інлайн-обчислення, а накопичені по вікнах градієнти ділить на `iters` **до** `clip_grads` і `opt.step` — так optimizer бачить градієнт того самого mean-loss, що друкується (`total_loss / iters`);
+- `CharRNNLoss` окремо звіряє `dlogits` із finite-difference скалярного mean-loss (найгірша похибка 1.44e-04).
+
+Перевірено запуском `main_rnn.cpp`: loss падає 3.30 → 0.44 за 300 епох, генерація працює, `exit=0`. Зміна зачіпає `src/demos/char_rnn.cpp` (виклик OK, але це вперше в цьому етапі змінюється код демо) і `tests/gradcheck.cpp`.
 
 ### Ще не зроблено
 
