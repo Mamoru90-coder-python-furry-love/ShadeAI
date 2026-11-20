@@ -71,7 +71,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 
 ```
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense), MNIST MLP (Dense→ReLU→Dense→ReLU→Dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss) + валідація входів CharRNN::compute_loss (CharRNNVal); NaN-guard self-test
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки), CharRNN (embedding→GRU BPTT→dense), MNIST MLP (Dense→ReLU→Dense→ReLU→Dense), MNIST CNN (Conv→ReLU→MaxPool ×2→Dense→Dense) + cross-entropy dlogits (GPTLoss, CharRNNLoss) + валідація входів CharRNN::compute_loss (CharRNNVal); NaN-guard self-test
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
 tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
@@ -96,6 +96,7 @@ TransformerBlock OK worst rel err 2.68e-05
 GPT             OK  worst rel err 3.48e-05
 CharRNN         OK  worst rel err 3.43e-05
 MLP             OK  worst rel err 9.11e-06
+CNN             OK  worst rel err 3.47e-06
 GPTLoss         OK  worst rel err 1.60e-04
 CharRNNLoss     OK  worst rel err 1.44e-04
 ```
@@ -144,7 +145,7 @@ CharRNNLoss     OK  worst rel err 1.44e-04
 
 #### Gradient checking — P2
 
-`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` і `CharRNNLoss` звіряють `dlogits` із `GPT::compute_loss` / `CharRNN::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss. Обидва loss-харнеси мають тотожний NaN-guard, що й загальний `gradcheck`. Також перевірено **MNIST MLP** — реальну композицію `Dense → ReLU → Dense → ReLU → Dense` з демо `mnist_mlp.cpp` (6 груп параметрів + градієнт по входу).
+`tests/gradcheck.cpp` (складається з тим самим прапорцем, що й у `build\test.bat`): скінченна різниця `eps=1e-3`, відносна похибка з знаменником `max(1,|num|,|ana|)`, поріг `GRAD_TOL=2e-3`. Покрито: Dense, LayerNorm, GRU, SelfAttention (causal), **Embedding** (лише `w`/`gw` — входи дискретні, `backward()` повертає порожній градієнт), **TransformerBlock** (усі 12 параметрів + градієнт по входу `x`, включно з residual-потоком і GELU), **маленький GPT** (8 vocab / dim 4 / 2 блоки / ctx 8 — 27 груп параметрів; 2 блоки спеціально, щоб перевірити зворотний обхід `GPT::backward`). Окремо `GPTLoss` і `CharRNNLoss` звіряють `dlogits` із `GPT::compute_loss` / `CharRNN::compute_loss` (cross-entropy, шлях реального тренування) проти скінченної різниці скалярного mean-loss. Обидва loss-харнеси мають тотожний NaN-guard, що й загальний `gradcheck`. Також перевірено **MNIST MLP** — реальну композицію `Dense → ReLU → Dense → ReLU → Dense` з демо `mnist_mlp.cpp` (6 груп параметрів + градієнт по входу), та **MNIST CNN** — реальну композицію `Conv → ReLU → MaxPool ×2 → Dense → Dense` з демо `mnist_cnn.cpp` (8 груп параметрів + градієнт по входу).
 
 `gpt.cpp` включається в тест з `#define main gpt_cli_main`, тобто перевіряється **реальна** композиція моделі, а не її копія. Градієнти, що накопичуються (`Dense/Attention/Embedding` через `+=`), коректно обнуляються харнесом перед єдиним аналітичним `backward`; числові `forward()` під час sweep не пишуть у градієнти. Тренувальний цикл (`opt.zero_grad` на початку епохи й після `opt.step`) перевірено окремо — накопичення між мікро-батчами є навмисним і далі ділиться на `iters_since_step`.
 
@@ -152,7 +153,7 @@ Embedding використовує послідовність із **повто�
 
 **NaN-guard.** Порівняння `NaN > worst` повертає `false`, тож без явної перевірки нечисловий градієнт міг би непомітно лишити `worst = 0` і дати хибний `OK`. Харнеси (`gradcheck`, `gpt_loss_gradcheck`, `charrnn_loss_gradcheck`) тепер мають `finite_ok` і перевіряють `std::isfinite(num)`, `std::isfinite(a)` та `std::isfinite(err)`; будь-яка нечислова величина друкує діагностику й робить результат `FAIL`. Регресійний self-test (`nan_guard_selftests`) підсовує NaN в аналітичний і в числовий градієнт окремо — обидва мають бути відхилені. Sentinel вимагає саме причини відмови: `expect_fail` повертає `!ok && nonfinite_seen`, тож відмова з будь-якої іншої причини не зараховується. Емпірично перевірено двічі: (1) з тимчасово вимкненою перевіркою `isfinite` обидва sentinel-и друкують `not rejected` і тест падає з `exit=1`; (2) якщо прибрати лише встановлення `nonfinite_seen` (залишивши `finite_ok = false`), sentinel-и знову падають — тобто вони справді перевіряють причину, а не просто факт відмови. З повним кодом обидва проходять тихо.
 
-Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 9.90e-06, TransformerBlock 2.68e-05, GPT 3.48e-05, CharRNN 3.43e-05, MLP 9.11e-06, GPTLoss 1.60e-04, CharRNNLoss 1.44e-04 — усі нижче порогу.
+Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 9.90e-06, TransformerBlock 2.68e-05, GPT 3.48e-05, CharRNN 3.43e-05, MLP 9.11e-06, CNN 3.47e-06, GPTLoss 1.60e-04, CharRNNLoss 1.44e-04 — усі нижче порогу.
 
 #### Gradient checking char-RNN — P2 (продовження)
 
@@ -186,11 +187,19 @@ Embedding використовує послідовність із **повто�
 
 `GRAD_EPS = 1e-3` винесено у спільну константу — ним користуються всі три finite-difference харнеси й перевірка мінімальної відстані, тож вони не можуть розійтися. Фактичний мінімальний запас у поточному прогоні: **7.123e-02** (вимога 2.000e-02). Негативний контроль із неможливим порогом (`1e10`) підтвердив, що вичерпання спроб коректно дає `FAIL` та `exit=1`.
 
-Наступний кандидат у цій черзі — **MNIST CNN** (потім transformer demo). Окремо варто перевірити `CrossEntropyLoss::forward` (використовується в MLP і в `main.cpp`, але ще не має власного gradcheck).
+#### Gradient checking MNIST CNN — P2 (продовження) + виправлення backward
+
+`tests/gradcheck.cpp` підключає реальний `src/demos/mnist_cnn.cpp` (за тим самим принципом `#ifndef SHADE_CNN_NO_MAIN`) і перевіряє повну композицію: `Conv(3×3,p=1) → ReLU → MaxPool(2×2,s=2) → Conv(3×3,p=1) → ReLU → MaxPool → Dense(ReLU) → Dense`. Додано конфігурований конструктор `CNN(h, w, cin, c1o, c2o, hid, out)`; дефолтний MNIST-конфіг 28×28 / 1→8→16 / 128 / 10 не змінено; помилку в коментарі (`Dense(400→128)`) виправлено на фактичні `784 → 128 → 10`. Тест використовує крихітну модель `6×6, 1→2→3, hid=4, out=3` (6→3→1 просторова, `flat_dim=3`, 108 параметрів), batch 1. Перевірено **усі 8 груп параметрів + градієнт по входу**, найгірша похибка **3.47e-06**.
+
+Перевірка виявила **реальну помилку в демо**: у `CNN::backward` ReLU застосовувався *після* conv backward (`c2.backward(a2.backward(d2))` було навпаки `a2.backward(c2.backward(d2))`). Через це похідні `c1.w/c1.b` і `c2.w/c2.b` обчислювалися без множника ReLU, а `d(input)` — у невірному порядку. Поки результат `a1.backward(...)` у CLI відкидався, навчання «працювало», але градієнти згорткових шарів були хибними. Виправлено порядок: спочатку `a.backward()`, потім `conv.backward()`. Повернення `d(input)` із `CNN::backward` source-сумісне — CLI ігнорує значення.
+
+Як і для MLP, `prepare_cnn_with_relu_margin()` перегенеровує модель (до 64 спроб), поки всі сирі перед-активації (conv1, conv2 та `f1.last_input·W+b`) не будуть за `2.0e-02` від нуля. `a1/a2.last_in` містять сирі conv-виходи (Conv2D не клямпує), тож читаються напряму; сиру перед-активацію `f1` (Dense з `use_relu=true`) обчислено з кешованого `f1.last_input`. Спроба додатково перевіряти запас між двома найбільшими значеннями у вікні MaxPool була відкинута як непотрібна: після виправлення порядку backward тест стабільний і без неї.
+
+Наступний кандидат — transformer demo. Окремо варто перевірити `CrossEntropyLoss::forward` (використовується в MLP/CNN і в `main.cpp`, але ще не має власного gradcheck).
 
 ### Ще не зроблено
 
-- Gradient checking покриває GPT, char-RNN і MNIST MLP, але не покриває MNIST CNN, `transformer_lm` / `transformer_test` і окремо `CrossEntropyLoss::forward`.
+- Gradient checking покриває GPT, char-RNN, MNIST MLP і MNIST CNN, але не покриває `transformer_lm` / `transformer_test` і окремо `CrossEntropyLoss::forward`.
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
 - Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
 

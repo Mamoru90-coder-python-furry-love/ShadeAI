@@ -22,6 +22,11 @@
 #define SHADE_MLP_NO_MAIN
 #include "../src/demos/mnist_mlp.cpp"
 #undef SHADE_MLP_NO_MAIN
+// Same pattern for the CNN demo: include only the model struct, not the CLI
+// (which pulls in the missing stb_image.h via the MNIST loader).
+#define SHADE_CNN_NO_MAIN
+#include "../src/demos/mnist_cnn.cpp"
+#undef SHADE_CNN_NO_MAIN
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -361,6 +366,28 @@ static f32 prepare_mlp_with_relu_margin(MLP& model, Tensor& x) {
     return -1.0f;
 }
 
+// CNN has three ReLU sites: after c1 (a1), after c2 (a2), and inside f1
+// (Dense(use_relu=true), whose raw pre-activation is not cached). Conv2D does
+// not clamp, so a1/a2.last_in are the raw conv outputs and can be used
+// directly; f1.last_input is the flattened tensor, so its pre-activation is
+// recomputed from the cached input. As with the MLP, a kink anywhere makes the
+// finite difference disagree with backward for reasons unrelated to the math.
+static f32 prepare_cnn_with_relu_margin(CNN& model, Tensor& x) {
+    const f32 required = RELU_MARGIN_FACTOR * GRAD_EPS;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        for (auto* p : model.params()) randomize(*p);
+        x = random_tensor(1, model.H * model.W);
+        model.forward(x); // fills a1/a2.last_in and f1.last_input
+        Tensor pre_f1 = model.f1.last_input.matmul(model.f1.w).add(model.f1.b);
+        f32 min_abs = std::numeric_limits<f32>::infinity();
+        for (const Tensor* t : { &model.a1.last_in, &model.a2.last_in, &pre_f1 })
+            for (i32 i = 0; i < t->size(); i++)
+                min_abs = std::fmin(min_abs, std::fabs(t->data[i]));
+        if (min_abs >= required) return min_abs;
+    }
+    return -1.0f;
+}
+
 int main() {
     srand(2026);
     bool ok = true;
@@ -493,6 +520,29 @@ int main() {
                 [&] { return model.forward(x); },
                 [&](const Tensor& dout, std::vector<Tensor>& ig) {
                     ig.push_back(model.backward(dout)); // MLP now returns d(input)
+                },
+                model.params(), model.grads(), {&x});
+        }
+    }
+
+    // Also last (same RNG reason). Tiny spatial config keeps the full param
+    // sweep cheap while exercising the real Conv -> ReLU -> MaxPool x2 ->
+    // Dense -> Dense composition, including maxpool routing and conv col2im.
+    {
+        CNN model(6, 6, 1, 2, 3, 4, 3); // 6->3->1 spatial, flat_dim = 3, 108 params
+        Tensor x;
+        f32 margin = prepare_cnn_with_relu_margin(model, x);
+        if (margin < 0.0f) {
+            std::fprintf(stderr, "CNN: no draw with ReLU pre-activation margin >= %.3e\n",
+                         RELU_MARGIN_FACTOR * GRAD_EPS);
+            ok = false;
+        } else {
+            std::printf("CNN          ReLU margin %.3e (>= %.3e)\n",
+                        margin, RELU_MARGIN_FACTOR * GRAD_EPS);
+            ok &= gradcheck("CNN",
+                [&] { return model.forward(x); },
+                [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                    ig.push_back(model.backward(dout)); // CNN now returns d(input)
                 },
                 model.params(), model.grads(), {&x});
         }
