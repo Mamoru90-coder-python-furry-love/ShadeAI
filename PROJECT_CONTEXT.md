@@ -71,7 +71,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 
 ```
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention, включно з h0
+tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention (включно з h0), Embedding, TransformerBlock, маленького GPT (2 блоки) + cross-entropy dlogits; NaN-guard self-test
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
 tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
@@ -87,10 +87,14 @@ build\test.bat
 Останній результат `gradcheck` ( tolerance `2e-3` ):
 
 ```
-Dense        OK  worst rel err 1.18e-05
-LayerNorm    OK  worst rel err 2.42e-05
-GRU          OK  worst rel err 1.80e-05
-Attention    OK  worst rel err 2.55e-05
+Dense           OK  worst rel err 1.18e-05
+LayerNorm       OK  worst rel err 2.42e-05
+GRU             OK  worst rel err 1.80e-05
+Attention       OK  worst rel err 2.55e-05
+Embedding       OK  worst rel err 9.90e-06
+TransformerBlock OK worst rel err 2.68e-05
+GPT             OK  worst rel err 3.48e-05
+GPTLoss         OK  worst rel err 1.72e-04
 ```
 
 ### Виправлені математичні помилки
@@ -141,7 +145,11 @@ Attention    OK  worst rel err 2.55e-05
 
 `gpt.cpp` включається в тест з `#define main gpt_cli_main`, тобто перевіряється **реальна** композиція моделі, а не її копія. Градієнти, що накопичуються (`Dense/Attention/Embedding` через `+=`), коректно обнуляються харнесом перед єдиним аналітичним `backward`; числові `forward()` під час sweep не пишуть у градієнти. Тренувальний цикл (`opt.zero_grad` на початку епохи й після `opt.step`) перевірено окремо — накопичення між мікро-батчами є навмисним і далі ділиться на `iters_since_step`.
 
-Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 4.27e-06, TransformerBlock 4.12e-05, GPT 3.49e-05, GPTLoss 1.72e-04 — усі нижче порогу.
+Embedding використовує послідовність із **повторюваними ID** (`0,1,0,2,1,0,3,1,4,5,6,7`), щоб перевірити накопичення градієнта в `gw` для одного токена; усі рядки vocab присутні.
+
+**NaN-guard.** Порівняння `NaN > worst` повертає `false`, тож без явної перевірки нечисловий градієнт міг би непомітно лишити `worst = 0` і дати хибний `OK`. Харнес (`gradcheck` і `gpt_loss_gradcheck`) тепер має `finite_ok` і перевіряє `std::isfinite(num)`, `std::isfinite(a)` та `std::isfinite(err)`; будь-яка нечислова величина друкує діагностику й робить результат `FAIL`. Регресійний self-test (`nan_guard_selftests`) підсовує NaN в аналітичний і в числовий градієнт окремо — обидва мають бути відхилені. Емпірично перевірено: з тимчасово вимкненою перевіркою `isfinite` обидва sentinel-и друкують `not rejected` і тест падає з `exit=1`; з перевіркою — тихо проходять.
+
+Фактичні найгірші відносні похибки: Dense 1.18e-05, LayerNorm 2.42e-05, GRU 1.80e-05, Attention 2.55e-05, Embedding 9.90e-06, TransformerBlock 2.68e-05, GPT 3.48e-05, GPTLoss 1.72e-04 — усі нижче порогу.
 
 ### Ще не зроблено
 

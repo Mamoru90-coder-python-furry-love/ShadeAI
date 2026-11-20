@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -47,11 +48,14 @@ static f32 mse(const Tensor& pred, const Tensor& target, Tensor* dout) {
 }
 
 template <typename Forward, typename Backward>
+// expect_fail is used by the NaN sentinel self-test below: it inverts the
+// result and suppresses output when a deliberately broken backward is fed in.
 static bool gradcheck(const std::string& name,
                       Forward forward, Backward backward,
                       const std::vector<Tensor*>& params,
                       const std::vector<Tensor*>& grads,
-                      const std::vector<Tensor*>& inputs) {
+                      const std::vector<Tensor*>& inputs,
+                      bool expect_fail = false) {
     const f32 eps = 1e-3f;
 #ifndef GRAD_TOL
 #define GRAD_TOL 2e-3f
@@ -77,6 +81,9 @@ static bool gradcheck(const std::string& name,
 
     f32 worst = 0;
     std::string worst_at;
+    // NaN > worst is false, so without this flag a non-finite gradient could
+    // silently leave worst at 0 and report a false OK.
+    bool finite_ok = true;
 
     auto numeric = [&](Tensor& p, i32 idx) {
         f32 orig = p.data[idx];
@@ -96,7 +103,21 @@ static bool gradcheck(const std::string& name,
             for (i32 i = 0; i < list[k]->size(); i++) {
                 f32 num = numeric(*list[k], i);
                 f32 a = ana[k][i];
+                if (!std::isfinite(num) || !std::isfinite(a)) {
+                    if (!expect_fail)
+                        std::fprintf(stderr, "%s: %s[%zu].data[%d] non-finite gradient (numeric=%g, analytic=%g)\n",
+                                     name.c_str(), kind.c_str(), k, i, (double)num, (double)a);
+                    finite_ok = false;
+                    continue;
+                }
                 f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
+                if (!std::isfinite(err)) {
+                    if (!expect_fail)
+                        std::fprintf(stderr, "%s: %s[%zu].data[%d] non-finite error\n",
+                                     name.c_str(), kind.c_str(), k, i);
+                    finite_ok = false;
+                    continue;
+                }
                 if (err > group_worst) { group_worst = err; group_at = std::to_string(i); }
                 if (err > worst) { worst = err; worst_at = kind + "[" + std::to_string(k) + "].data[" + std::to_string(i) + "]"; }
             }
@@ -108,7 +129,8 @@ static bool gradcheck(const std::string& name,
     sweep(params, "param", analytic);
     sweep(inputs, "input", analytic_input);
 
-    bool ok = worst <= tol;
+    bool ok = finite_ok && worst <= tol;
+    if (expect_fail) return !ok; // sentinel: rejection is the expected result
     std::printf("%-12s %s  worst rel err %.3e at %s\n",
                 name.c_str(), ok ? "OK" : "FAIL", worst, worst_at.c_str());
     return ok;
@@ -127,6 +149,7 @@ static bool gpt_loss_gradcheck() {
 
     const f32 eps = 1e-3f;
     f32 worst = 0;
+    bool finite_ok = true;
     for (i32 i = 0; i < logits.size(); i++) {
         f32 orig = logits.data[i];
         logits.data[i] = orig + eps;
@@ -136,11 +159,66 @@ static bool gpt_loss_gradcheck() {
         logits.data[i] = orig;
         f32 num = (lp - lm) / (2.0f * eps);
         f32 a = dlogits.data[i];
+        if (!std::isfinite(num) || !std::isfinite(a)) {
+            std::fprintf(stderr, "GPTLoss: non-finite gradient at logit %d (numeric=%g, analytic=%g)\n",
+                         i, (double)num, (double)a);
+            finite_ok = false;
+            continue;
+        }
         f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
+        if (!std::isfinite(err)) {
+            std::fprintf(stderr, "GPTLoss: non-finite error at logit %d\n", i);
+            finite_ok = false;
+            continue;
+        }
         if (err > worst) worst = err;
     }
-    bool ok = worst <= 2e-3f;
+    bool ok = finite_ok && worst <= 2e-3f;
     std::printf("%-12s %s  worst rel err %.3e\n", "GPTLoss", ok ? "OK" : "FAIL", worst);
+    return ok;
+}
+
+// Regression for the NaN trap: `NaN > worst` is false, so a non-finite
+// gradient used to be able to leave worst at 0 and report a false OK. Probe
+// both paths: a NaN analytic gradient and a NaN numeric (forward) gradient.
+// expect_fail inverts the harness result and silences the expected diagnostics.
+static bool nan_guard_selftests() {
+    const f32 nan = std::numeric_limits<f32>::quiet_NaN();
+    bool ok = true;
+    {
+        Dense fc(2, 2);
+        randomize(fc.w); randomize(fc.b);
+        Tensor x = random_tensor(3, 2);
+        bool rejected = gradcheck("NaNSentinelA",
+            [&] { return fc.forward(x); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                ig.push_back(fc.backward(dout));
+                for (i32 i = 0; i < fc.gw.size(); i++) fc.gw.data[i] = nan; // poison analytic
+            },
+            {&fc.w}, {&fc.gw}, {&x}, true);
+        if (!rejected) {
+            std::fprintf(stderr, "gradcheck: NaN analytic gradient was not rejected\n");
+            ok = false;
+        }
+    }
+    {
+        Dense fc(2, 2);
+        randomize(fc.w); randomize(fc.b);
+        Tensor x = random_tensor(3, 2);
+        bool rejected = gradcheck("NaNSentinelN",
+            [&] { Tensor y = fc.forward(x); y.data[0] = nan; return y; }, // poison numeric
+            [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                Tensor dx = fc.backward(dout);
+                for (i32 i = 0; i < fc.gw.size(); i++) fc.gw.data[i] = 0.0f; // keep analytic finite
+                for (i32 i = 0; i < dx.size(); i++) dx.data[i] = 0.0f;
+                ig.push_back(dx);
+            },
+            {&fc.w}, {&fc.gw}, {&x}, true);
+        if (!rejected) {
+            std::fprintf(stderr, "gradcheck: NaN numeric gradient was not rejected\n");
+            ok = false;
+        }
+    }
     return ok;
 }
 
@@ -201,8 +279,11 @@ int main() {
         // receive a non-zero finite-difference signal.
         Embedding emb(8, 4);
         randomize(emb.w);
-        Tensor ids(1, 8);
-        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = (f32)(i % 8);
+        // Repeated IDs exercise gradient accumulation into gw for the same
+        // token; all vocab rows still appear so no weight is left untested.
+        const f32 seq[] = { 0, 1, 0, 2, 1, 0, 3, 1, 4, 5, 6, 7 };
+        Tensor ids(1, (i32)(sizeof(seq) / sizeof(seq[0])));
+        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = seq[i];
         ok &= gradcheck("Embedding",
             [&] { return emb.forward(ids); },
             [&](const Tensor& dout, std::vector<Tensor>&) { emb.backward(dout, ids); },
@@ -234,6 +315,7 @@ int main() {
     }
 
     ok &= gpt_loss_gradcheck();
+    ok &= nan_guard_selftests();
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");
