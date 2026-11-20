@@ -66,19 +66,20 @@ struct LayerNorm {
             const f32* xp = &last_x.data[i * dim];
             f32* dxp = &dx.data[i * dim];
             f32 std = sqrtf(last_var.data[i] + eps);
-            f32 std2 = std * std;
             f32 mean = last_mean.data[i];
+            // dL/dx = (gamma/std) * (dout - mean(dout*gamma) - xhat*mean(dout*gamma*xhat)).
             f32 gsum = 0, gdsum = 0;
             for (i32 j = 0; j < dim; j++) {
+                f32 x_hat = (xp[j] - mean) / std;
                 gbeta.data[j] += dp[j];
-                ggamma.data[j] += dp[j] * (xp[j] - mean) / std;
-                gsum += dp[j];
-                gdsum += dp[j] * (xp[j] - mean);
+                ggamma.data[j] += dp[j] * x_hat;
+                gsum += dp[j] * gamma.data[j];
+                gdsum += dp[j] * gamma.data[j] * x_hat;
             }
             f32 a = gsum / dim, b = gdsum / dim;
             for (i32 j = 0; j < dim; j++) {
                 f32 x_hat = (xp[j] - mean) / std;
-                dxp[j] = gamma.data[j] / std * (dp[j] - a - x_hat * b);
+                dxp[j] = (gamma.data[j] * dp[j] - a - x_hat * b) / std;
             }
         }
         return dx;

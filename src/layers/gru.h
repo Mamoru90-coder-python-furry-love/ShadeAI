@@ -154,7 +154,7 @@ struct GRU {
                     gWn.at(k, j) += dn.data[j] * xs[t].data[k];
             for (i32 j = 0; j < hidden_dim; j++)
                 for (i32 k = 0; k < hidden_dim; k++)
-                    gUn.at(k, j) += dn.data[j] * rt.data[k] * h_prev.data[k];
+                    gUn.at(k, j) += dn.data[j] * rt.data[j] * h_prev.data[k];
             for (i32 j = 0; j < hidden_dim; j++)
                 gbn.data[j] += dn.data[j];
 

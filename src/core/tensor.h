@@ -6,7 +6,9 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
-#include <cassert>
+#include <limits>
+#include <stdexcept>
+#include <string>
 #if defined(__AVX__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -17,21 +19,38 @@
 using f32 = float;
 using i32 = int32_t;
 
+// Checks stay active in Release (NDEBUG does not disable them).
+static inline i32 checked_size(i32 r, i32 c) {
+    if (r < 0 || c < 0) throw std::invalid_argument("Tensor: negative dimension");
+    if (r != 0 && c > std::numeric_limits<i32>::max() / r)
+        throw std::length_error("Tensor: rows * cols overflows i32");
+    return r * c;
+}
+
 struct Tensor {
     i32 rows, cols;
     std::vector<f32> data;
 
     Tensor() : rows(0), cols(0) {}
-    Tensor(i32 r, i32 c, f32 v = 0.0f) : rows(r), cols(c), data(r * c, v) {}
-    Tensor(i32 r, i32 c, const std::vector<f32>& d) : rows(r), cols(c), data(d) {}
+    Tensor(i32 r, i32 c, f32 v = 0.0f) : rows(r), cols(c), data(checked_size(r, c), v) {}
+    Tensor(i32 r, i32 c, const std::vector<f32>& d) : rows(r), cols(c), data(d) {
+        if (d.size() != (size_t)checked_size(r, c))
+            throw std::invalid_argument("Tensor: data size does not match rows * cols");
+    }
 
-    f32& at(i32 r, i32 c) { assert(r >= 0 && r < rows && c >= 0 && c < cols); return data[r * cols + c]; }
-    f32  at(i32 r, i32 c) const { assert(r >= 0 && r < rows && c >= 0 && c < cols); return data[r * cols + c]; }
+    void check_bounds(i32 r, i32 c) const {
+        if (r < 0 || r >= rows || c < 0 || c >= cols)
+            throw std::out_of_range("Tensor::at: index out of range");
+    }
+    f32& at(i32 r, i32 c) { check_bounds(r, c); return data[r * cols + c]; }
+    f32  at(i32 r, i32 c) const { check_bounds(r, c); return data[r * cols + c]; }
     i32 size() const { return (i32)data.size(); }
 
     void fill(f32 v) { std::fill(data.begin(), data.end(), v); }
     Tensor clone() const { return Tensor(rows, cols, data); }
     Tensor slice(i32 start, i32 count) const {
+        if (start < 0 || count < 0 || start + count > rows)
+            throw std::out_of_range("Tensor::slice: range out of bounds");
         Tensor r(count, cols);
         for (i32 i = 0; i < count; i++)
             for (i32 j = 0; j < cols; j++)
@@ -57,7 +76,7 @@ struct Tensor {
                 for (i32 j = 0; j < cols; j++)
                     r.at(i, j) = at(i, j) * o.data[i];
         } else {
-            printf("ERROR: emul shape mismatch (%dx%d * %dx%d)\n", rows, cols, o.rows, o.cols);
+            throw std::invalid_argument("Tensor::emul: unsupported shape combination");
         }
         return r;
     }
@@ -75,7 +94,7 @@ struct Tensor {
                 for (i32 j = 0; j < cols; j++)
                     r.at(i, j) = at(i, j) + o.data[i];
         } else {
-            printf("ERROR: add shape mismatch (%dx%d + %dx%d)\n", rows, cols, o.rows, o.cols);
+            throw std::invalid_argument("Tensor::add: unsupported shape combination");
         }
         return r;
     }
@@ -93,7 +112,7 @@ struct Tensor {
                 for (i32 j = 0; j < cols; j++)
                     r.at(i, j) = at(i, j) - o.data[i];
         } else {
-            printf("ERROR: sub shape mismatch (%dx%d - %dx%d)\n", rows, cols, o.rows, o.cols);
+            throw std::invalid_argument("Tensor::sub: unsupported shape combination");
         }
         return r;
     }
@@ -106,7 +125,7 @@ struct Tensor {
 
     Tensor matmul(const Tensor& o) const {
         i32 M = rows, N = cols, P = o.cols;
-        assert(o.rows == N);
+        if (o.rows != N) throw std::invalid_argument("Tensor::matmul: incompatible dimensions");
         Tensor r(M, P, 0.0f);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)

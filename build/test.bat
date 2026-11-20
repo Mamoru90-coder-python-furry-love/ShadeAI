@@ -1,0 +1,30 @@
+@echo off
+setlocal
+set SRC=%~dp0..\src
+set OUT=%~dp0
+set TESTS=%~dp0..\tests
+
+where cl >nul 2>nul
+if not errorlevel 1 goto :build
+for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -products * -latest -property installationPath`) do set VSPATH=%%i
+call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+
+:build
+set CFLAGS=/nologo /std:c++17 /O2 /arch:AVX /openmp /EHsc /I"%SRC%"
+
+cl %CFLAGS% "%TESTS%\simd_check.cpp" /Fe:"%OUT%simd_check.exe" || goto :fail
+cl %CFLAGS% "%TESTS%\gradcheck.cpp" /Fe:"%OUT%gradcheck.exe" || goto :fail
+cl /nologo /std:c++17 /O2 /arch:AVX /DNDEBUG /EHsc /I"%SRC%" "%TESTS%\tensor_checks.cpp" /Fe:"%OUT%tensor_checks.exe" || goto :fail
+cl %CFLAGS% "%SRC%\main.cpp" /Fe:"%OUT%demos.exe" || goto :fail
+
+"%OUT%simd_check.exe" || goto :fail
+"%OUT%gradcheck.exe" || goto :fail
+"%OUT%tensor_checks.exe" || goto :fail
+"%OUT%demos.exe" >nul || goto :fail
+
+echo All tests passed.
+exit /b 0
+
+:fail
+echo Tests FAILED.
+exit /b 1

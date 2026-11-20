@@ -119,28 +119,18 @@ struct SelfAttention {
             const Tensor& sm = head_softmax[h];
             const f32* smp = sm.data.data();
 
-            // dH = sm @ dO_per_head
-            Tensor dH(T, embed_dim, 0.0f);
-            for (i32 i = 0; i < T; i++)
-                for (i32 c = 0; c < head_dim; c++) {
-                    f32 s = 0;
-                    i32 j = h * head_dim + c;
-                    for (i32 k = 0; k < T; k++)
-                        s += smp[i * T + k] * dO.data[k * embed_dim + j];
-                    dH.data[i * embed_dim + j] = s;
-                }
-
-            // dS = dH @ V^T_per_head
-            Tensor dS(T, T, 0.0f);
+            // dA = dO @ V^T_per_head: gradient on the attention probabilities.
+            Tensor dA(T, T, 0.0f);
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
 #endif
             for (i32 i = 0; i < T; i++)
                 for (i32 j = 0; j < T; j++) {
                     f32 s = 0;
-                    for (i32 k = 0; k < head_dim; k++)
-                        s += dH.data[i * embed_dim + h * head_dim + k] * last_v.data[j * embed_dim + h * head_dim + k];
-                    dS.data[i * T + j] = s;
+                    const f32* dop = dO.data.data() + (size_t)i * embed_dim + h * head_dim;
+                    const f32* vp = last_v.data.data() + (size_t)j * embed_dim + h * head_dim;
+                    for (i32 c = 0; c < head_dim; c++) s += dop[c] * vp[c];
+                    dA.data[i * T + j] = s;
                 }
 
             // backprop through softmax (masked for causal)
@@ -152,9 +142,9 @@ struct SelfAttention {
                 f32 dot = 0;
                 i32 limit = causal ? i + 1 : T;
                 for (i32 j = 0; j < limit; j++)
-                    dot += smp[i * T + j] * dS.data[i * T + j];
+                    dot += smp[i * T + j] * dA.data[i * T + j];
                 for (i32 j = 0; j < limit; j++)
-                    dScores.data[i * T + j] = smp[i * T + j] * (dS.data[i * T + j] - dot);
+                    dScores.data[i * T + j] = smp[i * T + j] * (dA.data[i * T + j] - dot);
             }
 
             // dQ += dScores @ K * scale,  dK += dScores^T @ Q * scale
@@ -173,7 +163,7 @@ struct SelfAttention {
                     dK.data[i * embed_dim + j] += dk * scale;
                 }
 
-            // dV += sm^T @ dH_per_head
+            // dV += sm^T @ dO_per_head
             Tensor dVh(T, head_dim, 0.0f);
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static)
@@ -183,7 +173,7 @@ struct SelfAttention {
                     f32 s = 0;
                     i32 j = h * head_dim + c;
                     for (i32 k = 0; k < T; k++)
-                        s += smp[k * T + i] * dH.data[k * embed_dim + j];
+                        s += smp[k * T + i] * dO.data[k * embed_dim + j];
                     dVh.data[i * head_dim + c] = s;
                 }
             for (i32 i = 0; i < T; i++)
