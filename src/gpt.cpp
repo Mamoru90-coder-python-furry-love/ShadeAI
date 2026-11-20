@@ -189,7 +189,10 @@ static constexpr i32 GPT_VERSION = 1;
 // 50M floats = 200 MB. A hostile config must be rejected before any GPT object
 // is built. Weights, gradients and Dense transpose caches all count.
 static constexpr int64_t GPT_MAX_MODEL_ELEMS = 50000000;
-// Forward activations: T*dim buffers and the T*T attention score matrices.
+// Checkpoint load keeps the staged `weights` vector alive while infer_gpt()
+// constructs the model (params extra floats), then moves buffers in.
+static constexpr int64_t GPT_MAX_LOAD_ELEMS = 75000000;
+// Peak live activation tensors across forward+backward of every block.
 static constexpr int64_t GPT_MAX_ACTIVATION_ELEMS = 20000000;
 
 struct GPTConfig { i32 vocab, dim, blocks, max_len; };
@@ -214,14 +217,100 @@ static std::vector<ExpectedTensor> gpt_expected_shapes(const GPTConfig& c) {
     return s;
 }
 
-// Peak activation memory. Every TransformerBlock keeps its own attention
-// caches: last_scores + last_softmax + 4x head_softmax = 6*T*T, plus last_x,
-// last_q/k/v/out and head_out = 6*T*dim. Peaks inside forward/backward add
-// another ~3*T*T (sm, dA, dScores) and ~26*T*dim (ff1_out, ff1_act, dO/dQ/dK/dV,
-// the block backward intermediates). None of this is shared between blocks.
-static int64_t gpt_activation_estimate(const GPTConfig& c) {
+// ---------------------------------------------------------------------------
+// Tensor lifetime ledger. Coefficients below are DERIVED from the layer code,
+// not guessed. T = ctx, d = dim (4 heads => head_dim = d/4), v = vocab.
+//
+// PERSISTENT activation caches owned by ONE TransformerBlock after forward
+// (all alive simultaneously through forward AND backward):
+//   SelfAttention: last_x/-q/-k/-v/-out (5 Td) + head_out (4 x T*d/4 = Td)
+//                    -> 6 Td
+//                  last_scores (T^2) + last_softmax (T^2)
+//                    + head_softmax (4 x T^2)          -> 6 T^2
+//   LayerNorm x2  : last_x (2 Td) + last_mean/last_var (4 T) -> 2 Td + 4 T
+//   Dense ff1/ff2 : last_input/last_output (Td+4Td+4Td+Td)   -> 10 Td
+//   Act (GELU)    : last_in (T*4d)                            -> 4 Td
+//   Block fields  : last_x/-attn_out/-x1/-y/-ffn_out/-x2      -> 6 Td
+//   ------------------------------------------------------------------------
+//   persistent subtotal = 28 Td + 6 T^2 + 4 T
+//
+// FORWARD transient peak, on top of that persistent set:
+//   ff1.forward = x.matmul(w).add(b): matmul result (4Td) + add result (4Td)
+//   + copy into last_output (4Td) = 12 Td;  attention head buffer sm = T^2.
+// BACKWARD transient peak, on top of that persistent set:
+//   12 named locals in TransformerBlock::backward = 18 Td
+//     (dx2, dy_skip, dffn, dffn2=4Td, dffn1_act=4Td, dy_ffn, dy_total,
+//      dx1, dx_skip, dattn, d_from_attn, dx_total),
+//   + SelfAttention::backward dO/dQ/dK/dV/dx = 5 Td,
+//   + per-head dA + dScores = 2 T^2.
+//
+//   per-block peak = persistent + max(fwd 12Td+T^2, bwd 23Td+2T^2)
+//                  = 51 Td + 8 T^2 + 4 T
+//
+// GPT level (outside blocks): output Dense keeps last_input (Td) +
+//   last_output (Tv); forward adds h (Td) + pe (Td) + logits (Tv) and
+//   output.forward matmul/add (3Tv); training keeps logits+dlogits (2Tv)
+//   + output.backward d (Tv) + dh (Td). Conservative: 4 Tv + 3 Td.
+// ---------------------------------------------------------------------------
+
+// All budget operands are non-negative; reject negatives and overflow before
+// any comparison or allocation.
+static bool ck_mul(int64_t a, int64_t b, int64_t& out) {
+    if (a < 0 || b < 0) return false;
+    if (a != 0 && b > INT64_MAX / a) return false;
+    out = a * b;
+    return true;
+}
+static bool ck_add(int64_t a, int64_t b, int64_t& out) {
+    if (a < 0 || b < 0) return false;
+    if (a > INT64_MAX - b) return false;
+    out = a + b;
+    return true;
+}
+
+// Separate phase peaks for ONE block, so the ledger can be audited term by
+// term. Each helper returns false on int64 overflow.
+static bool block_persistent_act(int64_t t, int64_t d, int64_t& out) {
+    // 28 Td + 6 T^2 + 4 T
+    int64_t t2, td, a, b, c;
+    if (!ck_mul(t, t, t2) || !ck_mul(t, d, td)) return false;
+    if (!ck_mul(28, td, a) || !ck_mul(6, t2, b) || !ck_mul(4, t, c)) return false;
+    if (!ck_add(a, b, a) || !ck_add(a, c, out)) return false;
+    return true;
+}
+static bool block_forward_transient(int64_t t, int64_t d, int64_t& out) {
+    // 12 Td (ff1 matmul+add+last_output copy) + 1 T^2 (head softmax sm).
+    int64_t t2, td, a, b;
+    if (!ck_mul(t, t, t2) || !ck_mul(t, d, td)) return false;
+    if (!ck_mul(12, td, a) || !ck_add(a, t2, b)) return false;
+    out = b; return true;
+}
+static bool block_backward_transient(int64_t t, int64_t d, int64_t& out) {
+    // 23 Td (18 Td block locals + 5 Td attention internals) + 2 T^2 (dA, dScores).
+    int64_t t2, td, a, b;
+    if (!ck_mul(t, t, t2) || !ck_mul(t, d, td)) return false;
+    if (!ck_mul(23, td, a) || !ck_mul(2, t2, b)) return false;
+    if (!ck_add(a, b, out)) return false;
+    return true;
+}
+
+static bool gpt_activation_estimate(const GPTConfig& c, int64_t& out) {
     const int64_t t = c.max_len, d = c.dim, b = c.blocks, v = c.vocab;
-    return b * (9 * t * t + 26 * t * d) + 2 * t * v + 2 * t * d;
+    int64_t persistent, fwd, bwd, transient, per_block, blocks_all;
+    int64_t tv, td, m4v, m3d, gpt_lvl;
+    if (!block_persistent_act(t, d, persistent)) return false;
+    if (!block_forward_transient(t, d, fwd)) return false;
+    if (!block_backward_transient(t, d, bwd)) return false;
+    // Forward and backward transients never overlap: take the larger.
+    transient = bwd > fwd ? bwd : fwd;
+    if (!ck_add(persistent, transient, per_block)) return false;
+    if (!ck_mul(b, per_block, blocks_all)) return false;
+    // GPT-level: 4 Tv + 3 Td (output Dense caches + logits/dlogits/pe/h).
+    if (!ck_mul(t, v, tv) || !ck_mul(t, d, td)) return false;
+    if (!ck_mul(4, tv, m4v) || !ck_mul(3, td, m3d)) return false;
+    if (!ck_add(m4v, m3d, gpt_lvl)) return false;
+    if (!ck_add(blocks_all, gpt_lvl, out)) return false;
+    return true;
 }
 
 // Budget the whole model before any GPT object is constructed. Returns the
@@ -231,13 +320,25 @@ static bool gpt_config_budget(const GPTConfig& c, int64_t& out_params) {
     if (c.dim > std::numeric_limits<i32>::max() / 4) return false;
 
     const int64_t d = c.dim, v = c.vocab, b = c.blocks;
-    const int64_t params = 2 * v * d + v + b * (12 * d * d + 9 * d);
-    const int64_t caches = b * 8 * d * d + v * d; // ff1.wT + ff2.wT + output.wT
-    const int64_t model_elems = params * 2 + caches; // +1 for gradients
-    const int64_t act_elems = gpt_activation_estimate(c);
-    if (params <= 0 || model_elems <= 0 || act_elems <= 0) return false; // overflow
-    if (model_elems > GPT_MAX_MODEL_ELEMS) return false;
-    if (act_elems > GPT_MAX_ACTIVATION_ELEMS) return false;
+    int64_t d2, vd, head, t9, blk, blk_all, params;
+    int64_t cache_blk, cache_vd, caches, p2, model, load, act;
+    if (!ck_mul(d, d, d2) || !ck_mul(v, d, vd)) return false;
+    // params = 2*v*d + v + b*(12*d^2 + 9*d)
+    if (!ck_mul(2, vd, head) || !ck_add(head, v, head)) return false;
+    if (!ck_mul(12, d2, blk) || !ck_mul(9, d, t9) || !ck_add(blk, t9, blk)) return false;
+    if (!ck_mul(b, blk, blk_all) || !ck_add(head, blk_all, params)) return false;
+    // Dense transpose caches: ff1.wT + ff2.wT per block, output.wT once.
+    if (!ck_mul(8, d2, cache_blk) || !ck_mul(b, cache_blk, cache_blk)) return false;
+    if (!ck_mul(v, d, cache_vd) || !ck_add(cache_blk, cache_vd, caches)) return false;
+    // Construction steady state: params + grads + caches.
+    if (!ck_mul(2, params, p2) || !ck_add(p2, caches, model)) return false;
+    // Checkpoint load peak: staged weights vector coexists with the new model.
+    if (!ck_add(model, params, load)) return false;
+    if (!gpt_activation_estimate(c, act)) return false;
+    if (params <= 0 || model <= 0 || load <= 0 || act <= 0) return false;
+    if (model > GPT_MAX_MODEL_ELEMS) return false;
+    if (load > GPT_MAX_LOAD_ELEMS) return false;
+    if (act > GPT_MAX_ACTIVATION_ELEMS) return false;
     out_params = params;
     return true;
 }

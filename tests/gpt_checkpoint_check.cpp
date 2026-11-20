@@ -75,26 +75,84 @@ int main() {
                     (long long)params, (long long)actual, shapes.size());
     }
 
-    // Every block owns its T*T attention caches, so the activation estimate
-    // must grow linearly with blocks (a flat estimate misses this entirely).
+    // ---- activation ledger: coefficients derived from the live tensor fields ----
     {
         GPTConfig one = cfg; one.blocks = 1;
         GPTConfig eight = cfg; eight.blocks = 8;
-        const int64_t per_block =
-            9 * (int64_t)cfg.max_len * cfg.max_len + 26 * (int64_t)cfg.max_len * cfg.dim;
-        const int64_t a1 = gpt_activation_estimate(one);
-        const int64_t a8 = gpt_activation_estimate(eight);
+        int64_t a1 = -1, a8 = -1;
+        expect(gpt_activation_estimate(one, a1) && gpt_activation_estimate(eight, a8),
+               "activation estimate computes");
+        const int64_t t = cfg.max_len, d = cfg.dim;
+        const int64_t per_block = 51 * t * d + 8 * t * t + 4 * t;
         expect(a8 - a1 == 7 * per_block, "activation estimate scales with blocks");
-        std::printf("  activations: 1 block=%lld, 8 blocks=%lld\n",
-                    (long long)a1, (long long)a8);
+        // Ledger cross-check: 28Td persistent + 23Td max transient + 8T^2 + 4T.
+        expect(per_block == 28 * t * d + 23 * t * d + 8 * t * t + 4 * t,
+               "per-block coefficient matches tensor ledger");
+        std::printf("  activations: 1 block=%lld, 8 blocks=%lld (per block=%lld)\n",
+                    (long long)a1, (long long)a8, (long long)per_block);
     }
     {
+        // Each phase peak is auditable on its own and sums to the estimate.
+        const int64_t t = cfg.max_len, d = cfg.dim;
+        int64_t p = 0, f = 0, b = 0, total = 0;
+        expect(block_persistent_act(t, d, p) && p == 28 * t * d + 6 * t * t + 4 * t,
+               "persistent phase peak matches ledger");
+        expect(block_forward_transient(t, d, f) && f == 12 * t * d + t * t,
+               "forward phase peak matches ledger");
+        expect(block_backward_transient(t, d, b) && b == 23 * t * d + 2 * t * t,
+               "backward phase peak matches ledger");
+        expect(gpt_activation_estimate(cfg, total) &&
+               total == cfg.blocks * (p + (b > f ? b : f)) + 4 * t * cfg.vocab + 3 * t * d,
+               "activation estimate equals summed phase peaks");
+    }
+    {
+        // Many blocks x long ctx: the old flat 2*T^2 estimate accepted this.
         GPTConfig big = cfg; big.blocks = 100; big.max_len = 1000;
         int64_t p = 0;
-        // The old flat 2*T*T estimate would accept this (2e6 < 20e6).
         expect(2 * (int64_t)big.max_len * big.max_len <= GPT_MAX_ACTIVATION_ELEMS,
-               "regression setup: flat estimate would accept");
+               "regression setup: old flat estimate would accept");
         expect(!gpt_config_budget(big, p), "many-block activation budget rejected");
+    }
+    {
+        // Large ctx, tiny dim: the quadratic T^2 attention term dominates.
+        GPTConfig c = cfg; c.max_len = 1000000; c.dim = 4; c.blocks = 1;
+        int64_t p = 0;
+        expect(!gpt_config_budget(c, p), "large ctx / small dim rejected");
+    }
+    {
+        // Small ctx, large dim: the linear 51*T*d term is the discriminator.
+        GPTConfig small = cfg; small.max_len = 100; small.dim = 1024; small.blocks = 1;
+        GPTConfig big = small; big.max_len = 2000;
+        int64_t ps = 0, pb = 0;
+        expect(gpt_config_budget(small, ps), "small ctx / large dim accepted");
+        expect(!gpt_config_budget(big, pb), "linear dim term rejects larger ctx");
+    }
+    {
+        // Large vocab: T*v logits blow the GPT-level activation budget.
+        GPTConfig c = cfg; c.vocab = 1000000; c.dim = 4; c.blocks = 1; c.max_len = 32;
+        int64_t p = 0;
+        expect(!gpt_config_budget(c, p), "large vocab rejected via logits budget");
+    }
+    {
+        // Exact budget boundary: 2 blocks fit, 3 blocks cross the limit.
+        GPTConfig edge; edge.vocab = 32; edge.dim = 4; edge.blocks = 2; edge.max_len = 1000;
+        int64_t p = 0, a = 0;
+        expect(gpt_activation_estimate(edge, a) && a <= GPT_MAX_ACTIVATION_ELEMS,
+               "boundary: just under activation limit");
+        expect(gpt_config_budget(edge, p), "boundary config accepted");
+        edge.blocks = 3;
+        expect(gpt_activation_estimate(edge, a) && a > GPT_MAX_ACTIVATION_ELEMS,
+               "boundary: just over activation limit");
+        expect(!gpt_config_budget(edge, p), "boundary config rejected");
+    }
+    {
+        // Checked int64 arithmetic cannot silently wrap.
+        int64_t x = 0;
+        const int64_t imax = std::numeric_limits<int64_t>::max();
+        expect(!ck_mul(imax, 2, x), "checked multiply rejects overflow");
+        expect(!ck_add(imax, 1, x), "checked add rejects overflow");
+        expect(ck_mul(1000, 1000, x) && x == 1000000, "checked multiply exact");
+        expect(ck_add(1000, 1, x) && x == 1001, "checked add exact");
     }
 
     // Rebuild exactly like infer_gpt() does and compare logits.
