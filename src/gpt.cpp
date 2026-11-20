@@ -214,17 +214,27 @@ static std::vector<ExpectedTensor> gpt_expected_shapes(const GPTConfig& c) {
     return s;
 }
 
+// Peak activation memory. Every TransformerBlock keeps its own attention
+// caches: last_scores + last_softmax + 4x head_softmax = 6*T*T, plus last_x,
+// last_q/k/v/out and head_out = 6*T*dim. Peaks inside forward/backward add
+// another ~3*T*T (sm, dA, dScores) and ~26*T*dim (ff1_out, ff1_act, dO/dQ/dK/dV,
+// the block backward intermediates). None of this is shared between blocks.
+static int64_t gpt_activation_estimate(const GPTConfig& c) {
+    const int64_t t = c.max_len, d = c.dim, b = c.blocks, v = c.vocab;
+    return b * (9 * t * t + 26 * t * d) + 2 * t * v + 2 * t * d;
+}
+
 // Budget the whole model before any GPT object is constructed. Returns the
 // expected parameter count so the reader can enforce it per tensor.
 static bool gpt_config_budget(const GPTConfig& c, int64_t& out_params) {
     if (c.dim % 4 != 0) return false; // SelfAttention heads=4 and FFN need this
     if (c.dim > std::numeric_limits<i32>::max() / 4) return false;
 
-    const int64_t d = c.dim, v = c.vocab, b = c.blocks, t = c.max_len;
+    const int64_t d = c.dim, v = c.vocab, b = c.blocks;
     const int64_t params = 2 * v * d + v + b * (12 * d * d + 9 * d);
     const int64_t caches = b * 8 * d * d + v * d; // ff1.wT + ff2.wT + output.wT
     const int64_t model_elems = params * 2 + caches; // +1 for gradients
-    const int64_t act_elems = t * d * 8 + t * t * 2;
+    const int64_t act_elems = gpt_activation_estimate(c);
     if (params <= 0 || model_elems <= 0 || act_elems <= 0) return false; // overflow
     if (model_elems > GPT_MAX_MODEL_ELEMS) return false;
     if (act_elems > GPT_MAX_ACTIVATION_ELEMS) return false;

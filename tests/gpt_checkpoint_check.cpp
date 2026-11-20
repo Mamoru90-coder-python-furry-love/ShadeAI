@@ -75,6 +75,28 @@ int main() {
                     (long long)params, (long long)actual, shapes.size());
     }
 
+    // Every block owns its T*T attention caches, so the activation estimate
+    // must grow linearly with blocks (a flat estimate misses this entirely).
+    {
+        GPTConfig one = cfg; one.blocks = 1;
+        GPTConfig eight = cfg; eight.blocks = 8;
+        const int64_t per_block =
+            9 * (int64_t)cfg.max_len * cfg.max_len + 26 * (int64_t)cfg.max_len * cfg.dim;
+        const int64_t a1 = gpt_activation_estimate(one);
+        const int64_t a8 = gpt_activation_estimate(eight);
+        expect(a8 - a1 == 7 * per_block, "activation estimate scales with blocks");
+        std::printf("  activations: 1 block=%lld, 8 blocks=%lld\n",
+                    (long long)a1, (long long)a8);
+    }
+    {
+        GPTConfig big = cfg; big.blocks = 100; big.max_len = 1000;
+        int64_t p = 0;
+        // The old flat 2*T*T estimate would accept this (2e6 < 20e6).
+        expect(2 * (int64_t)big.max_len * big.max_len <= GPT_MAX_ACTIVATION_ELEMS,
+               "regression setup: flat estimate would accept");
+        expect(!gpt_config_budget(big, p), "many-block activation budget rejected");
+    }
+
     // Rebuild exactly like infer_gpt() does and compare logits.
     GPT gpt2(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
     auto params = gpt2.params();
