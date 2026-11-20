@@ -257,6 +257,20 @@ static bool charrnn_loss_validation_check() {
     rejects("target >= vocab", good_logits, t);
     t = good_targets.clone(); t.data[0] = 1.5f;
     rejects("non-integral target", good_logits, t);
+    // Non-finite / huge values must be rejected BEFORE any float->int cast:
+    // the cast is undefined for NaN, infinities, and out-of-int-range floats.
+    t = good_targets.clone(); t.data[0] = std::numeric_limits<f32>::quiet_NaN();
+    rejects("NaN target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = std::numeric_limits<f32>::infinity();
+    rejects("+Inf target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = -std::numeric_limits<f32>::infinity();
+    rejects("-Inf target", good_logits, t);
+    t = good_targets.clone(); t.data[0] = 1e30f;
+    rejects("huge finite target", good_logits, t);
+
+    // NOTE: the vocab_size > 0 guard in compute_loss is not directly testable
+    // through a real CharRNN: its Dense head already rejects a zero output
+    // dimension at construction, so no valid model can reach that branch.
 
     std::printf("%-12s %s\n", "CharRNNVal", ok ? "OK" : "FAIL");
     return ok;
