@@ -33,6 +33,9 @@
 
 static std::mt19937 rng(2026);
 static std::uniform_real_distribution<f32> dist(-0.6f, 0.6f);
+// Shared by every finite-difference harness and by the ReLU margin guard, so
+// the two cannot drift apart.
+static const f32 GRAD_EPS = 1e-3f;
 
 static Tensor random_tensor(i32 r, i32 c) {
     Tensor t(r, c);
@@ -66,7 +69,7 @@ static bool gradcheck(const std::string& name,
                       const std::vector<Tensor*>& grads,
                       const std::vector<Tensor*>& inputs,
                       bool expect_fail = false) {
-    const f32 eps = 1e-3f;
+    const f32 eps = GRAD_EPS;
 #ifndef GRAD_TOL
 #define GRAD_TOL 2e-3f
 #endif
@@ -162,7 +165,7 @@ static bool gpt_loss_gradcheck() {
     Tensor scratch(5, 8), dlogits(5, 8);
     gpt.compute_loss(logits, targets, dlogits);
 
-    const f32 eps = 1e-3f;
+    const f32 eps = GRAD_EPS;
     f32 worst = 0;
     bool finite_ok = true;
     for (i32 i = 0; i < logits.size(); i++) {
@@ -203,7 +206,7 @@ static bool charrnn_loss_gradcheck() {
     Tensor scratch(5, 8), dlogits(5, 8);
     model.compute_loss(logits, targets, dlogits);
 
-    const f32 eps = 1e-3f;
+    const f32 eps = GRAD_EPS;
     f32 worst = 0;
     bool finite_ok = true;
     for (i32 i = 0; i < logits.size(); i++) {
@@ -326,6 +329,38 @@ static bool nan_guard_selftests() {
     return ok;
 }
 
+// ReLU has a kink at 0: if a pre-activation sits within GRAD_EPS of it, the
+// central difference sees a different branch than the analytic derivative and
+// the check fails for a reason unrelated to the backward math. Rather than
+// trusting the RNG seed, regenerate the tiny model until every pre-activation
+// is at least RELU_MARGIN_FACTOR * GRAD_EPS away from zero. Returns the smallest
+// margin found, or a negative value if no acceptable draw was found.
+//
+// Note: f1/f2 are constructed with use_relu=true, so Dense::forward already
+// clamps in place and does not cache the raw pre-activation. Act::last_in is
+// therefore post-ReLU (mostly zeros) and cannot be used here; recompute the
+// raw values directly. f3 has use_relu=false and needs no margin.
+static const f32 RELU_MARGIN_FACTOR = 20.0f;
+static f32 prepare_mlp_with_relu_margin(MLP& model, Tensor& x) {
+    const f32 required = RELU_MARGIN_FACTOR * GRAD_EPS;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        for (auto* p : model.params()) randomize(*p);
+        x = random_tensor(3, 4);
+        Tensor pre1 = x.matmul(model.f1.w).add(model.f1.b);
+        Tensor h1 = pre1.clone();
+        for (i32 i = 0; i < h1.size(); i++)
+            if (h1.data[i] < 0.0f) h1.data[i] = 0.0f;
+        Tensor pre2 = h1.matmul(model.f2.w).add(model.f2.b);
+
+        f32 min_abs = std::numeric_limits<f32>::infinity();
+        for (const Tensor* t : { &pre1, &pre2 })
+            for (i32 i = 0; i < t->size(); i++)
+                min_abs = std::fmin(min_abs, std::fabs(t->data[i]));
+        if (min_abs >= required) return min_abs;
+    }
+    return -1.0f;
+}
+
 int main() {
     srand(2026);
     bool ok = true;
@@ -445,14 +480,22 @@ int main() {
         // Dense -> ReLU -> Dense -> ReLU -> Dense. Input is continuous, so
         // both parameter and input gradients are checked.
         MLP model(4, 6, 5, 3);
-        for (auto* p : model.params()) randomize(*p);
-        Tensor x = random_tensor(3, 4);
-        ok &= gradcheck("MLP",
-            [&] { return model.forward(x); },
-            [&](const Tensor& dout, std::vector<Tensor>& ig) {
-                ig.push_back(model.backward(dout)); // MLP now returns d(input)
-            },
-            model.params(), model.grads(), {&x});
+        Tensor x;
+        f32 margin = prepare_mlp_with_relu_margin(model, x);
+        if (margin < 0.0f) {
+            std::fprintf(stderr, "MLP: no draw with ReLU pre-activation margin >= %.3e\n",
+                         RELU_MARGIN_FACTOR * GRAD_EPS);
+            ok = false;
+        } else {
+            std::printf("MLP          ReLU margin %.3e (>= %.3e)\n",
+                        margin, RELU_MARGIN_FACTOR * GRAD_EPS);
+            ok &= gradcheck("MLP",
+                [&] { return model.forward(x); },
+                [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                    ig.push_back(model.backward(dout)); // MLP now returns d(input)
+                },
+                model.params(), model.grads(), {&x});
+        }
     }
 
     if (!ok) {
