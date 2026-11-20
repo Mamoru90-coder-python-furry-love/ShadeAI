@@ -73,7 +73,7 @@ Checkpoint тепер **самостійний**: magic/version + конфіг (
 tests/simd_check.cpp       — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
 tests/gradcheck.cpp        — central finite differences для Dense/LayerNorm/GRU/Attention, включно з h0
 tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
-tests/gpt_checkpoint_check.cpp — round-trip GPT checkpoint + інтеграційний inference-шлях
+tests/gpt_checkpoint_check.cpp — round-trip, top-k (включно з однаковими ймовірностями), бюджет конфігу, атомарний запис, пошкоджені файли
 tests/tensor_checks.cpp    — runtime перевірки навіть при /DNDEBUG
 tests/bench.cpp            — scalar vs AVX: matmul/attention/AdamW
 ```
@@ -107,12 +107,16 @@ Attention    OK  worst rel err 2.55e-05
 - `Tensor::slice()`: перевірка `start + count` без переповнення.
 - Перевірки параметрів конструкторів і форм входу в Dense/LayerNorm/GRU/Attention/Transformer.
 - GPT checkpoint: конфіг + tokenizer + ваги в одному файлі; `--load` відбудовує модель і генерує текст. `sample()` більше не має фіксованого буфера на 16384 токени.
+- Top-k: лишається **рівно** `top_k` токенів; однакові ймовірності ламаються за індексом (раніше могло лишитись `top_k + 1`).
+- `Tokenizer::read()` перевіряє, що ID 0..3 — це `<PAD>`, `<UNK>`, `<BOS>`, `<EOS>`.
+- Бюджет checkpointу: межа на один тензор, сумарну вагу й добуток `ctx*dim` (200 MB) **до** створення моделі.
+- Атомарний запис GPT checkpointу: `*.tmp` + `MoveFileExA(MOVEFILE_REPLACE_EXISTING)` на Windows; попередній файл не пошкоджується, якщо запис перервався.
 
 ### Ще не зроблено
 
 - Gradient checking не покриває весь TransformerBlock/Embedding/GRU в складі GPT.
-- Атомарний запис checkpoint-ів (temp file + rename) поки не реалізований; транзакційне **читання** вже є.
-- `train_config.json` не читається — конфіг зашитий у `gpt.cpp`.
+- `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
+- Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
 
 ---
 

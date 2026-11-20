@@ -1,3 +1,12 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "core/tensor.h"
 #include "core/loss.h"
 #include "layers/transformer.h"
@@ -14,7 +23,30 @@
 #include <cstring>
 #include <ctime>
 #include <cstdlib>
+#include <algorithm>
 #include <memory>
+
+// Keep exactly top_k largest probabilities. Ties break by lower index, so a
+// uniform distribution cannot accidentally keep more than top_k tokens.
+inline float keep_top_k(std::vector<float>& probs, int top_k) {
+    const int n = (int)probs.size();
+    if (top_k <= 0 || top_k >= n) {
+        float s = 0;
+        for (float p : probs) s += p;
+        return s;
+    }
+    std::vector<int> order(n);
+    for (int i = 0; i < n; i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (probs[a] != probs[b]) return probs[a] > probs[b];
+        return a < b;
+    });
+    std::vector<char> keep(n, 0);
+    float s = 0;
+    for (int i = 0; i < top_k; i++) { keep[order[i]] = 1; s += probs[order[i]]; }
+    for (int i = 0; i < n; i++) if (!keep[i]) probs[i] = 0.0f;
+    return s;
+}
 
 struct GPT {
     i32 vocab_size, dim, num_blocks, max_len;
@@ -117,18 +149,8 @@ struct GPT {
             probs[j] = expf((logits[j] - maxv) / fmaxf(temp, 0.01f));
             sum += probs[j];
         }
-        if (top_k > 0 && top_k < n) {
-            float threshold = 0;
-            std::vector<float> sorted(probs);
-            std::sort(sorted.begin(), sorted.end(), std::greater<float>());
-            threshold = sorted[std::min(top_k, n - 1)];
-            float filtered_sum = 0;
-            for (int j = 0; j < n; j++) {
-                if (probs[j] < threshold) probs[j] = 0;
-                filtered_sum += probs[j];
-            }
-            if (filtered_sum > 0) { sum = filtered_sum; }
-        }
+        float filtered = keep_top_k(probs, top_k);
+        if (filtered > 0) sum = filtered;
         float r = (float)rand() / RAND_MAX;
         float cum = 0;
         for (int j = 0; j < n; j++) {
@@ -163,12 +185,27 @@ struct GPT {
 // ---------------------------------------------------------------------------
 static constexpr i32 GPT_MAGIC = 0x53484447; // "SHDG"
 static constexpr i32 GPT_VERSION = 1;
+// 50M floats = 200 MB. Caps each tensor, the total weights, and one activation
+// buffer, so a hostile config cannot exhaust RAM before the model is built.
+static constexpr int64_t GPT_MAX_TENSOR_ELEMS = 50000000;
 
 struct GPTConfig { i32 vocab, dim, blocks, max_len; };
 
+static bool atomic_replace(const std::string& tmp, const std::string& dst) {
+#ifdef _WIN32
+    return MoveFileExA(tmp.c_str(), dst.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(tmp.c_str(), dst.c_str()) == 0;
+#endif
+}
+
 bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     using namespace Serialize::detail;
-    FILE* f = fopen(path.c_str(), "wb");
+    // Write to a sibling temp file first. The previous good checkpoint stays
+    // untouched until the whole file is on disk and the rename succeeds.
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) return false;
     bool ok = true;
     auto wi = [&](i32 v) { if (ok) ok = write_i32(f, v); };
@@ -188,7 +225,11 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
         ok = write_tensor(f, *p);
     }
     if (fclose(f) != 0) ok = false;
-    return ok;
+    if (!ok || !atomic_replace(tmp, path)) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
@@ -209,6 +250,8 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
         if (cfg.dim < 1 || cfg.dim > 65536) break;
         if (cfg.blocks < 1 || cfg.blocks > 1024) break;
         if (cfg.max_len < 1 || cfg.max_len > 1000000) break;
+        // Individually legal values can still combine into a huge allocation.
+        if ((int64_t)cfg.max_len * cfg.dim > GPT_MAX_TENSOR_ELEMS) break;
 
         if (!tok.read(f) || tok.vocab_size != cfg.vocab) break;
 
@@ -216,9 +259,12 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
         if (!read_i32(f, nt) || nt < 1 || nt > 10000) break;
         weights.clear();
         weights.reserve((size_t)nt);
+        int64_t total_elems = 0;
         for (i32 i = 0; i < nt; i++) {
             Tensor t;
-            if (!read_tensor(f, t)) break;
+            if (!read_tensor(f, t, -1, -1, (size_t)GPT_MAX_TENSOR_ELEMS)) break;
+            total_elems += (int64_t)t.rows * t.cols;
+            if (total_elems > GPT_MAX_TENSOR_ELEMS) break;
             weights.push_back(std::move(t));
         }
         if ((i32)weights.size() != nt || !at_eof(f)) break;

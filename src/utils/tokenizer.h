@@ -107,7 +107,7 @@ struct Tokenizer {
     bool read(FILE* f) {
         if (!f) return false;
         i32 n;
-        if (fread(&n, sizeof(i32), 1, f) != 1 || n < 0 || n > 1000000) return false;
+        if (fread(&n, sizeof(i32), 1, f) != 1 || n < SPECIAL || n > 1000000) return false;
         std::vector<std::string> words;
         words.reserve((size_t)n);
         for (i32 i = 0; i < n; i++) {
@@ -117,6 +117,11 @@ struct Tokenizer {
             if (len > 0 && fread(&w[0], 1, (size_t)len, f) != (size_t)len) return false;
             words.push_back(std::move(w));
         }
+        // Generation indexes BOS/EOS/UNK directly, so their IDs must be intact.
+        static const char* specials[SPECIAL] = { "<PAD>", "<UNK>", "<BOS>", "<EOS>" };
+        for (i32 i = 0; i < SPECIAL; i++)
+            if (words[(size_t)i] != specials[i]) return false;
+
         id2word = std::move(words);
         word2id.clear();
         for (i32 i = 0; i < n; i++) word2id[id2word[(size_t)i]] = i;

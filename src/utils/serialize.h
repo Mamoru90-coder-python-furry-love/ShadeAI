@@ -43,13 +43,16 @@ inline bool read_i32(FILE* f, i32& v) { return read_exact(f, &v, sizeof(v)); }
 inline bool write_i32(FILE* f, i32 v) { return write_exact(f, &v, sizeof(v)); }
 
 // Read one tensor block into a temporary. Nothing touches the model tensors.
-inline bool read_tensor(FILE* f, Tensor& out, i32 expected_rows = -1, i32 expected_cols = -1) {
+// max_elems is checked before allocation so a corrupt shape cannot exhaust RAM.
+inline bool read_tensor(FILE* f, Tensor& out, i32 expected_rows = -1, i32 expected_cols = -1,
+                        size_t max_elems = std::numeric_limits<size_t>::max()) {
     i32 r, c;
     if (!read_i32(f, r) || !read_i32(f, c)) return false;
     if (!valid_shape(r, c)) return false;
     if (expected_rows >= 0 && (r != expected_rows || c != expected_cols)) return false;
 
     const size_t n = (size_t)r * (size_t)c;
+    if (n > max_elems) return false;
     std::vector<f32> d(n);
     if (n && !read_exact(f, d.data(), n * sizeof(f32))) return false;
     if (has_naninf(d.data(), (i32)n)) return false;

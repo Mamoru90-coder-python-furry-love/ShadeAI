@@ -1,9 +1,10 @@
-// Self-contained GPT checkpoint: round-trip + corruption coverage.
+// Self-contained GPT checkpoint: round-trip, corruption, budget, top-k, atomic save.
 // gpt.cpp's CLI main is renamed so its GPT/checkpoint helpers can be tested.
 #define main gpt_cli_main
 #include "../src/gpt.cpp"
 #undef main
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,9 @@ static bool write_all(const fs::path& p, const std::vector<char>& b) {
     if (!f) return false;
     f.write(b.data(), (std::streamsize)b.size());
     return f.good();
+}
+static int nonzero(const std::vector<float>& p) {
+    return (int)std::count_if(p.begin(), p.end(), [](float v) { return v > 0.0f; });
 }
 
 int main() {
@@ -73,7 +77,29 @@ int main() {
     expect(worst == 0.0f, "reloaded model produces identical logits");
     std::printf("  max logit diff: %g\n", worst);
 
-    // Corrupt files must be rejected, not parsed into a broken model.
+    // ---- top-k selection: exactly k survive, even when probabilities tie ----
+    {
+        std::vector<float> p{ 0.10f, 0.30f, 0.05f, 0.40f, 0.15f };
+        float s = keep_top_k(p, 3);
+        expect(nonzero(p) == 3, "top-k keeps exactly 3 of 5");
+        expect(p[1] > 0 && p[3] > 0 && p[4] > 0 && p[0] == 0 && p[2] == 0,
+               "top-k keeps the 3 largest");
+        expect(std::fabs(s - 0.85f) < 1e-6f, "top-k surviving sum");
+    }
+    {
+        std::vector<float> p(5, 0.2f); // every probability identical
+        keep_top_k(p, 3);
+        expect(nonzero(p) == 3, "top-k with ties keeps exactly 3");
+        expect(p[0] > 0 && p[1] > 0 && p[2] > 0 && p[3] == 0 && p[4] == 0,
+               "top-k tie-break goes to lower indices");
+    }
+    {
+        std::vector<float> p{ 0.5f, 0.5f };
+        keep_top_k(p, 10);
+        expect(nonzero(p) == 2, "top_k >= n keeps everything");
+    }
+
+    // ---- corrupt files must be rejected, not parsed into a broken model ----
     auto bytes = read_all(ck);
     expect(bytes.size() > 64, "checkpoint size");
 
@@ -87,24 +113,70 @@ int main() {
     expect(write_all(bad, append) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "trailing garbage rejected");
 
-    auto poke = [&](size_t off, i32 v) {
+    auto poke_i32 = [&](size_t off, i32 v) {
         auto b = bytes;
         std::memcpy(b.data() + off, &v, sizeof(v));
         return write_all(bad, b);
     };
-    expect(poke(0, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    auto poke2_i32 = [&](size_t off1, i32 v1, size_t off2, i32 v2) {
+        auto b = bytes;
+        std::memcpy(b.data() + off1, &v1, sizeof(v1));
+        std::memcpy(b.data() + off2, &v2, sizeof(v2));
+        return write_all(bad, b);
+    };
+    auto poke_byte = [&](size_t off, char v) {
+        auto b = bytes;
+        b[off] = v;
+        return write_all(bad, b);
+    };
+
+    expect(poke_i32(0, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "bad magic rejected");
-    expect(poke(8, 10000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(8, 10000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "absurd vocab rejected");
-    expect(poke(12, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+    expect(poke_i32(12, 0) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "invalid dim rejected");
 
-    // Standalone tokenizer file round-trip.
+    // Individually legal dim/ctx combine into a 6.5e10-element activation.
+    expect(poke2_i32(12, 65536, 20, 1000000) &&
+           !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "combined config budget rejected");
+
+    // "<PAD>" starts at 24 (header) + 4 (word count) + 4 (its length).
+    expect(poke_byte(32, 'X') && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "corrupt special token in checkpoint rejected");
+
+    // First tensor block sits after the tokenized vocabulary and tensor count.
+    size_t tensor_off = 24 + 4;
+    for (const auto& w : tok.id2word) tensor_off += 4 + w.size();
+    tensor_off += 4;
+    expect(poke2_i32(tensor_off, 100000, tensor_off + 4, 100000) &&
+           !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "oversized tensor rejected before allocation");
+
+    // ---- standalone tokenizer file: round-trip + special-token check ----
     expect(tok.save(tokf.string()), "tok.save");
     Tokenizer tok3;
     expect(tok3.load(tokf.string()), "tok.load");
     expect(tok3.id2word == tok.id2word && tok3.vocab_size == tok.vocab_size,
            "tokenizer file round-trip");
+
+    auto tokbytes = read_all(tokf);
+    tokbytes[8] = 'X'; // "<PAD>" -> "X<PAD"
+    expect(write_all(bad, tokbytes) && !tok3.load(bad.string()),
+           "corrupt special token in tokenizer file rejected");
+
+    // ---- atomic save: no leftover temp, and a failed write keeps the old model ----
+    expect(!fs::exists(ck.string() + ".tmp"), "no temp file after successful save");
+    expect(save_gpt(ck.string(), gpt, tok), "re-save over existing checkpoint");
+    expect(read_gpt_checkpoint(ck.string(), cfg, tok2, weights), "reload after overwrite");
+
+    const fs::path blocked = fs::path(ck.string() + ".tmp");
+    fs::create_directory(blocked);
+    expect(!save_gpt(ck.string(), gpt, tok), "save fails when temp path is blocked");
+    expect(read_gpt_checkpoint(ck.string(), cfg, tok2, weights),
+           "previous checkpoint survives a failed save");
+    fs::remove(blocked);
 
     for (const auto& p : { ck, bad, tokf }) fs::remove(p);
 
