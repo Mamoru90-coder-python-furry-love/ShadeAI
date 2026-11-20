@@ -34,13 +34,16 @@ struct CrossEntropyLoss {
                 sum += e;
             }
 
+            // dlogits must match the returned mean loss: p - target, then / batch.
+            const f32 inv = 1.0f / (sum * n);
             j = 0;
 #if defined(__AVX__)
-            __m256 inv = simd::set8(1.0f / sum);
+            __m256 inv8 = simd::set8(inv), tn8 = simd::set8(1.0f / n);
             for (; j + 8 <= C; j += 8)
-                simd::store8(dp + j, _mm256_sub_ps(_mm256_mul_ps(simd::load8(dp + j), inv), simd::load8(tp + j)));
+                simd::store8(dp + j, _mm256_sub_ps(_mm256_mul_ps(simd::load8(dp + j), inv8),
+                                                   _mm256_mul_ps(simd::load8(tp + j), tn8)));
 #endif
-            for (; j < C; j++) dp[j] = dp[j] / sum - tp[j];
+            for (; j < C; j++) dp[j] = dp[j] * inv - tp[j] / n;
 
             // one-hot in practice: skip 12000 logs per row that multiply by zero
             for (j = 0; j < C; j++) {

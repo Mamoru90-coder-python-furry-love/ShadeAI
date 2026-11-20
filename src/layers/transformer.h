@@ -14,7 +14,7 @@ struct PositionalEncoding {
         Tensor pe(T, dim);
         for (i32 i = 0; i < T; i++) {
             for (i32 j = 0; j < dim; j++) {
-                f32 angle = (f32)i / std::pow(10000.0f, (f32)(j % 2) / dim);
+                f32 angle = (f32)i / std::pow(10000.0f, (f32)(j & ~1) / dim);
                 if (j % 2 == 0)
                     pe.at(i, j) = std::sin(angle);
                 else

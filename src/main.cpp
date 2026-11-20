@@ -129,8 +129,8 @@ void test_attn() {
         opt.step(pp,gp);
         if(ep%50==0)printf("  ep %d loss=%.6f\n",ep,tl/N);
     }
-    // test
-    srand(42);
+    // test on an independent seed, not a replay of the training set
+    srand(12345);
     float err=0;
     for(int t=0;t<10;t++){
         Tensor x(T,D);for(int i=0;i<T;i++)for(int j=0;j<D;j++)x.at(i,j)=((float)rand()/RAND_MAX-0.5f)*2;

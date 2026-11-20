@@ -39,16 +39,21 @@ bool load(const std::string& path, const std::vector<Tensor*>& params) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
     i32 n;
-    fread(&n, sizeof(i32), 1, f);
-    for (i32 i = 0; i < n && i < (i32)params.size(); i++) {
+    if (fread(&n, sizeof(i32), 1, f) != 1 || n != (i32)params.size()) { fclose(f); return false; }
+    for (i32 i = 0; i < n; i++) {
         i32 r, c;
-        fread(&r, sizeof(i32), 1, f);
-        fread(&c, sizeof(i32), 1, f);
+        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1) {
+            fclose(f);
+            return false;
+        }
         if (params[i]->rows != r || params[i]->cols != c) {
             fclose(f);
             return false;
         }
-        fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f);
+        if (fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f) != (size_t)params[i]->size()) {
+            fclose(f);
+            return false;
+        }
     }
     fclose(f);
     return true;
@@ -82,13 +87,18 @@ ModelInfo load_model(const std::string& path, const std::vector<Tensor*>& params
     if (header[0] != 0x53484445) { fclose(f); return info; }
     info = { header[1], header[2], header[3], true };
     i32 n;
-    fread(&n, sizeof(i32), 1, f);
-    for (i32 i = 0; i < n && i < (i32)params.size(); i++) {
+    if (fread(&n, sizeof(i32), 1, f) != 1 || n != (i32)params.size()) {
+        fclose(f); info.valid = false; return info;
+    }
+    for (i32 i = 0; i < n; i++) {
         i32 r, c;
-        fread(&r, sizeof(i32), 1, f);
-        fread(&c, sizeof(i32), 1, f);
-        if (params[i]->rows != r || params[i]->cols != c) { fclose(f); info.valid = false; return info; }
-        fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f);
+        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1 ||
+            params[i]->rows != r || params[i]->cols != c) {
+            fclose(f); info.valid = false; return info;
+        }
+        if (fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f) != (size_t)params[i]->size()) {
+            fclose(f); info.valid = false; return info;
+        }
         if (has_naninf_tensor(*params[i])) { fclose(f); info.valid = false; return info; }   // poisoned checkpoint
     }
     fclose(f);

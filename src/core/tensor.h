@@ -6,6 +6,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <cassert>
 #if defined(__AVX__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -24,8 +25,8 @@ struct Tensor {
     Tensor(i32 r, i32 c, f32 v = 0.0f) : rows(r), cols(c), data(r * c, v) {}
     Tensor(i32 r, i32 c, const std::vector<f32>& d) : rows(r), cols(c), data(d) {}
 
-    f32& at(i32 r, i32 c) { return data[r * cols + c]; }
-    f32  at(i32 r, i32 c) const { return data[r * cols + c]; }
+    f32& at(i32 r, i32 c) { assert(r >= 0 && r < rows && c >= 0 && c < cols); return data[r * cols + c]; }
+    f32  at(i32 r, i32 c) const { assert(r >= 0 && r < rows && c >= 0 && c < cols); return data[r * cols + c]; }
     i32 size() const { return (i32)data.size(); }
 
     void fill(f32 v) { std::fill(data.begin(), data.end(), v); }
@@ -105,6 +106,7 @@ struct Tensor {
 
     Tensor matmul(const Tensor& o) const {
         i32 M = rows, N = cols, P = o.cols;
+        assert(o.rows == N);
         Tensor r(M, P, 0.0f);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)

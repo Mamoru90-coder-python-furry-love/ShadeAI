@@ -21,11 +21,11 @@ struct AdamW {
         // bias-correction factors + fused step coefficients — computed ONCE per step
         f32 p1t = std::pow(beta1, t);
         f32 p2t = std::pow(beta2, t);
-        f32 sb2 = std::sqrt(1.0f - p2t);
         f32 ib1 = 1.0f / (1.0f - p1t);
         f32 ib2 = 1.0f / (1.0f - p2t);
-        f32 km = lr * sb2 * ib1 * ib1;   // update multiplier
-        f32 kw = lr * sb2 * ib1 * wd;    // weight-decay multiplier
+        // m_hat = m*ib1, v_hat = v*ib2; decay is decoupled and never bias-corrected.
+        f32 km = lr * ib1;
+        f32 kw = lr * wd;
         for (size_t i = 0; i < params.size(); i++) {
             const f32* g = grads[i]->data.data();
             f32* p = params[i]->data.data();

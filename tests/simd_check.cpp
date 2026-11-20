@@ -2,6 +2,7 @@
 #include "../src/core/simd.h"
 #include "../src/core/loss.h"
 #include "../src/layers/attention.h"
+#include "../src/layers/transformer.h"
 #include "../src/optimizer/adamw.h"
 #include <cassert>
 #include <cmath>
@@ -125,7 +126,7 @@ int main() {
             for (i32 j = 0; j < C; j++) { rd.at(i, j) = std::exp(logits.at(i, j) - mx); sum += rd.at(i, j); }
             for (i32 j = 0; j < C; j++) {
                 f32 p = rd.at(i, j) / sum;
-                rd.at(i, j) = p - target.at(i, j);
+                rd.at(i, j) = (p - target.at(i, j)) / n;
                 ref -= target.at(i, j) * std::log(std::max(p, 1e-7f));
             }
         }
@@ -135,25 +136,40 @@ int main() {
     }
 
     {
+        // Independent AdamW reference: m_hat/(sqrt(v_hat)+eps) + decoupled decay.
         const i32 n = 37;
-        Tensor p(1, n), g(1, n), p0;
-        for (i32 i = 0; i < n; i++) { p.data[i] = dist(rng) * 0.1f; g.data[i] = dist(rng); }
-        p0 = p.clone();
+        const f32 b1 = 0.9f, b2 = 0.999f, wd = 0.1f, lr = 0.01f, eps = 1e-8f;
+        Tensor p(1, n), g(1, n);
+        std::vector<f32> pref(n), m(n, 0.0f), v(n, 0.0f);
+        for (i32 i = 0; i < n; i++) {
+            p.data[i] = pref[i] = dist(rng) * 0.1f;
+            g.data[i] = dist(rng);
+        }
         AdamW opt(0.01f, 0.1f);
         opt.add(p);
         std::vector<Tensor*> ps{ &p }, gs{ &g };
-        opt.step(ps, gs);
+        for (int step = 1; step <= 3; step++) {
+            opt.step(ps, gs);
+            f32 ib1 = 1.0f / (1.0f - std::pow(b1, step));
+            f32 ib2 = 1.0f / (1.0f - std::pow(b2, step));
+            for (i32 j = 0; j < n; j++) {
+                m[j] = b1 * m[j] + (1.0f - b1) * g.data[j];
+                v[j] = b2 * v[j] + (1.0f - b2) * g.data[j] * g.data[j];
+                f32 e = pref[j] - lr * (m[j] * ib1) / (std::sqrt(v[j] * ib2) + eps);
+                e -= lr * wd * e;
+                pref[j] = e;
+                assert(close(p.data[j], e, 1e-4f));
+            }
+        }
+    }
 
-        f32 t = 1.0f, b1 = 0.9f, b2 = 0.999f, wd = 0.1f, lr = 0.01f, eps = 1e-8f;
-        f32 ib1 = 1.0f / (1.0f - std::pow(b1, t)), ib2 = 1.0f / (1.0f - std::pow(b2, t));
-        f32 km = lr * std::sqrt(1.0f - std::pow(b2, t)) * ib1 * ib1;
-        f32 kw = lr * std::sqrt(1.0f - std::pow(b2, t)) * ib1 * wd;
-        for (i32 j = 0; j < n; j++) {
-            f32 mi = (1.0f - b1) * g.data[j];
-            f32 vi = (1.0f - b2) * g.data[j] * g.data[j];
-            f32 e = p0.data[j] - km * mi / (std::sqrt(vi * ib2) + eps);
-            e -= kw * e;
-            assert(close(p.data[j], e, 1e-4f));
+    {
+        const i32 dim = 8, pos = 3;
+        Tensor pe = PositionalEncoding(10, dim).forward(pos + 1);
+        for (i32 j = 0; j < dim; j++) {
+            f32 angle = (f32)pos / std::pow(10000.0f, (f32)(j & ~1) / dim);
+            f32 expected = (j % 2 == 0) ? std::sin(angle) : std::cos(angle);
+            assert(close(pe.at(pos, j), expected, 1e-5f));
         }
     }
 

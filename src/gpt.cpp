@@ -72,8 +72,9 @@ struct GPT {
             float inv = 1.0f / sum;
             float ptgt = dp[tgt] * inv;
             loss -= logf(fmaxf(ptgt, 1e-10f));
+            float gscale = inv / T; // dlogits for the mean loss over tokens
             for (i32 j = 0; j < vocab_size; j++)
-                dp[j] = dp[j] * inv - (j == tgt ? 1.0f : 0.0f);
+                dp[j] = dp[j] * gscale - (j == tgt ? 1.0f / T : 0.0f);
         }
         return loss / T;
     }
@@ -196,6 +197,15 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
         auto pp = gpt.params();
         auto gp = gpt.grads();
         opt.zero_grad(gp);
+        auto finish_step = [&]() {
+            f32 scale = 1.0f / (f32)iters_since_step; // average accumulated micro-batches
+            for (auto* g : gp)
+                for (i32 k = 0; k < g->size(); k++) g->data[k] *= scale;
+            gpt.clip_grads(1.0f);
+            opt.step(pp, gp);
+            opt.zero_grad(gp);
+            iters_since_step = 0;
+        };
         float tl = 0;
         int iters = 0;
         double t0 = clock();
@@ -222,18 +232,9 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
             iters++;
             iters_since_step++;
 
-            if (iters_since_step >= batch_size) {
-                gpt.clip_grads(1.0f);
-                opt.step(pp, gp);
-                opt.zero_grad(gp);
-                iters_since_step = 0;
-            }
+            if (iters_since_step >= batch_size) finish_step();
         }
-        if (iters_since_step > 0) {
-            gpt.clip_grads(1.0f);
-            opt.step(pp, gp);
-            iters_since_step = 0;
-        }
+        if (iters_since_step > 0) finish_step();
 
         double t1 = clock();
         float avg_loss = tl / fmaxf(1, iters);
