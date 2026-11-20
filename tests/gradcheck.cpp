@@ -16,6 +16,11 @@
 // The char-RNN demo has no main, so it can be included directly to check the
 // real embedding -> GRU (BPTT) -> dense composition.
 #include "../src/demos/char_rnn.cpp"
+// The transformer-LM demo has a CLI main; rename it to check the real
+// Embedding -> PositionalEncoding -> TransformerBlocks -> Dense composition.
+#define main transformer_lm_cli_main
+#include "../src/demos/transformer_lm.cpp"
+#undef main
 // Include only the MLP struct from the MNIST demo (its CLI main pulls in the
 // MNIST loader / stb_image.h). Checks the real
 // Dense -> ReLU -> Dense -> ReLU -> Dense composition on a tiny model.
@@ -239,6 +244,47 @@ static bool charrnn_loss_gradcheck() {
     }
     bool ok = finite_ok && worst <= 2e-3f;
     std::printf("%-12s %s  worst rel err %.3e\n", "CharRNNLoss", ok ? "OK" : "FAIL", worst);
+    return ok;
+}
+
+// Same check for transformer_lm's extracted compute_loss. The demo previously
+// fed unscaled (sum) dlogits to backward while printing a mean loss.
+static bool transformer_lm_loss_gradcheck() {
+    TransformerLM model(8, 4, 1);
+    Tensor logits = random_tensor(5, 8);
+    Tensor targets(1, 5);
+    for (i32 i = 0; i < targets.cols; i++) targets.data[i] = (f32)(i % 8);
+    Tensor scratch(5, 8), dlogits(5, 8);
+    model.compute_loss(logits, targets, dlogits);
+
+    const f32 eps = GRAD_EPS;
+    f32 worst = 0;
+    bool finite_ok = true;
+    for (i32 i = 0; i < logits.size(); i++) {
+        f32 orig = logits.data[i];
+        logits.data[i] = orig + eps;
+        f32 lp = model.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig - eps;
+        f32 lm = model.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig;
+        f32 num = (lp - lm) / (2.0f * eps);
+        f32 a = dlogits.data[i];
+        if (!std::isfinite(num) || !std::isfinite(a)) {
+            std::fprintf(stderr, "TransformerLMLoss: non-finite gradient at logit %d (numeric=%g, analytic=%g)\n",
+                         i, (double)num, (double)a);
+            finite_ok = false;
+            continue;
+        }
+        f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
+        if (!std::isfinite(err)) {
+            std::fprintf(stderr, "TransformerLMLoss: non-finite error at logit %d\n", i);
+            finite_ok = false;
+            continue;
+        }
+        if (err > worst) worst = err;
+    }
+    bool ok = finite_ok && worst <= 2e-3f;
+    std::printf("%-16s %s  worst rel err %.3e\n", "TransformerLMLoss", ok ? "OK" : "FAIL", worst);
     return ok;
 }
 
@@ -547,6 +593,21 @@ int main() {
                 model.params(), model.grads(), {&x});
         }
     }
+
+    // Last, for the same RNG reason. Checks the demo's own copy of the real
+    // Embedding -> PositionalEncoding -> TransformerBlocks -> Dense stack
+    // (two blocks, so the reversed block loop is exercised). Ids are discrete.
+    {
+        TransformerLM lm(8, 4, 2);
+        for (auto* p : lm.params()) randomize(*p);
+        Tensor ids(1, 5);
+        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = (f32)(i % 8);
+        ok &= gradcheck("TransformerLM",
+            [&] { return lm.forward(ids); },
+            [&](const Tensor& dout, std::vector<Tensor>&) { lm.backward(dout, ids); },
+            lm.params(), lm.grads(), {});
+    }
+    ok &= transformer_lm_loss_gradcheck();
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");

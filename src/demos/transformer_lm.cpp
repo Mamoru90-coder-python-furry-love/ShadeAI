@@ -45,6 +45,35 @@ struct TransformerLM {
         embed.backward(dh, ids);
     }
 
+    // Mean cross-entropy over tokens; dlogits is its exact gradient. The demo
+    // used to emit unscaled (sum) dlogits while printing the mean loss, so the
+    // optimized and reported objectives differed (same issue fixed in CharRNN).
+    float compute_loss(const Tensor& logits, const Tensor& targets, Tensor& dlogits) {
+        i32 T = logits.rows;
+        dlogits = Tensor(T, vocab_size, 0.0f);
+        float loss = 0;
+        for (i32 i = 0; i < T; i++) {
+            int tgt = (int)targets.data[i];
+            const f32* lp = &logits.data[i * vocab_size];
+            f32* dp = &dlogits.data[i * vocab_size];
+            float maxv = lp[0];
+            for (i32 j = 1; j < vocab_size; j++)
+                if (lp[j] > maxv) maxv = lp[j];
+            float sum = 0;
+            for (i32 j = 0; j < vocab_size; j++) {
+                float e = expf(lp[j] - maxv);
+                dp[j] = e;
+                sum += e;
+            }
+            float inv = 1.0f / sum;
+            loss -= logf(fmaxf(dp[tgt] * inv, 1e-10f));
+            float gscale = inv / T;
+            for (i32 j = 0; j < vocab_size; j++)
+                dp[j] = dp[j] * gscale - (j == tgt ? 1.0f / T : 0.0f);
+        }
+        return loss / T;
+    }
+
     void clip_grads(f32 max_norm) {
         f32 norm = 0;
         for (auto* g : grads())
@@ -171,23 +200,9 @@ void demo_transformer_lm() {
             }
 
             Tensor logits = lm.forward(ids);
-            Tensor dlogits(seq_len, vocab_size, 0.0f);
-            float loss = 0;
-            for (int i = 0; i < seq_len; i++) {
-                int tgt = (int)targets.data[i];
-                float maxv = logits.at(i, 0);
-                for (int j = 1; j < vocab_size; j++)
-                    if (logits.at(i, j) > maxv) maxv = logits.at(i, j);
-                float sum = 0;
-                for (int j = 0; j < vocab_size; j++)
-                    sum += expf(logits.at(i, j) - maxv);
-                for (int j = 0; j < vocab_size; j++) {
-                    float p = expf(logits.at(i, j) - maxv) / sum;
-                    dlogits.at(i, j) = p - (j == tgt ? 1.0f : 0.0f);
-                }
-                loss -= logf(fmaxf(expf(logits.at(i, tgt) - maxv) / sum, 1e-10f));
-            }
-            tl += loss / seq_len;
+            Tensor dlogits;
+            float loss = lm.compute_loss(logits, targets, dlogits);
+            tl += loss;
             lm.backward(dlogits, ids);
             iters_since_step++;
 
