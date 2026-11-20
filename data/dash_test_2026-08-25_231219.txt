@@ -1,0 +1,16 @@
+=== shade GPT train (log: ..\data\dash_test_2026-08-25_231219.txt) ===
+  data: ..\data\ukr_fiction.txt (198259016 chars, 189.1MB)
+  vocab: 12000
+  tokens: 50294320
+  loaded existing model (dim=256 blocks=8 ctx=64)
+  model: 99 tensors, 8 blocks, dim=256, ctx=64, lr=0.0006
+  params: 12465888 scalar
+  token freq: counted
+  map: t-SNE (поточна карта слів)
+dash: live http://localhost:8765 (dir: ../dashboard)
+  ep  0 loss=5.4616 [316s, 248 iters] у 
+щонативви 
+тазіаяк 
+казазіна 
+уюяккана 
+  checkpoint saved

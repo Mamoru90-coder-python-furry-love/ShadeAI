@@ -1,0 +1,12 @@
+=== shade GPT train (log: ../data/train_log_2026-08-06_120523.txt) ===
+  data: ../data/train_full3.txt (46094479 chars, 44.0MB)
+  vocab: 12000
+  tokens: 10940439
+  loaded existing model (dim=256 blocks=8 ctx=64)
+  model: 99 params, 8 blocks, dim=256, ctx=128, lr=6e-05
+  ep  0 loss=3.5955 [10195s, 1561 iters] до!
+USER: Створіть вірш,
+5. що чому,
+AI: Ям, які,м:
+1. 
+  checkpoint saved

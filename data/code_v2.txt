@@ -1,0 +1,310 @@
+USER: Як зробити факторіал в JavaScript?
+AI: function fact(n) { return n <= 1 ? 1 : n * fact(n-1) }
+USER: Напиши калькулятор на JavaScript
+AI: function calc(a, op, b) {
+  const ops = {"+": (x,y)=>x+y, "-": (x,y)=>x-y, "*": (x,y)=>x*y, "/": (x,y)=>x/y}
+  return ops[op] ? ops[op](a,b) : "unknown"
+}
+USER: Напиши Hello World на Elixir
+AI: IO.puts("Hello World")
+USER: Як написати Hello World в Scala?
+AI: object Hello extends App { println("Hello World") }
+USER: Напиши калькулятор на Ruby
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Як зробити факторіал в PHP?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як написати Hello World в TypeScript?
+AI: console.log("Hello World")
+USER: Як написати Hello World в C#?
+AI: using System;
+class Program { static void Main() { Console.WriteLine("Hello World"); } }
+USER: Як зробити факторіал в R?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як написати Hello World в Java?
+AI: public class Hello {
+  public static void main(String[] args) {
+    System.out.println("Hello World");
+  }
+}
+USER: Напиши калькулятор на Scala
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Напиши факторіал на SQL
+AI: WITH RECURSIVE fact(n,f) AS (SELECT 0,1 UNION ALL SELECT n+1, f*(n+1) FROM fact WHERE n<10) SELECT * FROM fact
+USER: Напиши Hello World на Dart
+AI: void main() { print("Hello World"); }
+USER: Напиши калькулятор на Rust
+AI: fn calc(a: f64, op: &str, b: f64) -> f64 {
+  match op {
+    "+" => a+b, "-" => a-b, "*" => a*b,
+    "/" => if b != 0.0 { a/b } else { 0.0 }, _ => 0.0
+  }
+}
+USER: Напиши Hello World на Ruby
+AI: puts "Hello World"
+USER: Як зробити факторіал в Elixir?
+AI: def fact(0), do: 1
+def fact(n), do: n * fact(n-1)
+USER: Напиши калькулятор на Julia
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке SQL injection?
+AI: Атака через вставку SQL коду в запит. Захист: prepared statements, параметризовані запити, екранування.
+USER: Напиши Hello World на Rust
+AI: fn main() { println!("Hello World"); }
+USER: Напиши калькулятор на Swift
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Як написати Hello World в Haskell?
+AI: main = putStrLn "Hello World"
+USER: Напиши факторіал на Dart
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши факторіал на Java
+AI: int fact(int n) { return n <= 1 ? 1 : n * fact(n-1); }
+USER: Як написати Hello World в Lua?
+AI: print("Hello World")
+USER: Напиши калькулятор на Python
+AI: def calc(a, op, b):
+  ops = {"+": lambda x,y: x+y, "-": lambda x,y: x-y, "*": lambda x,y: x*y, "/": lambda x,y: x/y if y else "err"}
+  return ops.get(op, lambda x,y: "unknown")(a, b)
+USER: Як написати Hello World в R?
+AI: cat("Hello World")
+USER: Напиши факторіал на Prolog
+AI: fact(0, 1).
+fact(N, R) :- N > 0, N1 is N-1, fact(N1, R1), R is N * R1.
+USER: Як зробити факторіал в TypeScript?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке O(n)?
+AI: O(n) означає лінійну складність. Час виконання пропорційний розміру даних. Приклад: пошук в масиві.
+USER: Як написати Hello World в Python?
+AI: print("Hello World")
+USER: Як написати Hello World в Go?
+AI: package main
+import "fmt"
+func main() { fmt.Println("Hello World") }
+USER: Напиши калькулятор на PHP
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке масив?
+AI: Масив зберігає елементи одного типу за індексом. Доступ O(1). В Python це list, в JS Array.
+USER: Що таке регекс?
+AI: Регулярні вирази для пошуку. \d цифра, \w буква/цифра, * 0+, + 1+. Приклад: [A-Z][a-z]+ імена.
+USER: Як зробити факторіал в C++?
+AI: int fact(int n) { return n <= 1 ? 1 : n * fact(n-1); }
+USER: Напиши Hello World на SQL
+AI: SELECT 'Hello World' AS greeting;
+USER: Як зробити факторіал в Swift?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши Hello World на Lua
+AI: print("Hello World")
+USER: Напиши Hello World на Julia
+AI: println("Hello World")
+USER: Напиши Hello World на Scala
+AI: object Hello extends App { println("Hello World") }
+USER: Напиши калькулятор на Elixir
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Як зробити факторіал в Rust?
+AI: fn fact(n: u64) -> u64 { if n <= 1 { 1 } else { n * fact(n-1) } }
+USER: Напиши калькулятор на SQL
+AI: SELECT CASE op WHEN '+' THEN a+b WHEN '-' THEN a-b WHEN '*' THEN a*b WHEN '/' THEN a/b END FROM calc;
+USER: Напиши факторіал на Elixir
+AI: def fact(0), do: 1
+def fact(n), do: n * fact(n-1)
+USER: Напиши факторіал на TypeScript
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке лямбда?
+AI: Анонімна функція. Python: lambda x: x*2. JS: x => x*2. Java: (x) -> x*2. C#: x => x*2.
+USER: Як написати Hello World в Kotlin?
+AI: fun main() = println("Hello World")
+USER: Напиши калькулятор на Dart
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Як написати Hello World в Julia?
+AI: println("Hello World")
+USER: Як зробити факторіал в Haskell?
+AI: fact 0 = 1
+fact n = n * fact (n-1)
+USER: Напиши калькулятор на Kotlin
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке криптографія?
+AI: Шифрування. Симетричне AES (один ключ), асиметричне RSA (публічний/приватний ключ), хешування SHA.
+USER: Напиши калькулятор на C#
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Напиши калькулятор на Lua
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке стек?
+AI: Стек LIFO. Операції push(додати) і pop(видалити) з вершини за O(1). Приклад: стек викликів функцій.
+USER: Напиши факторіал на C#
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши Hello World на Prolog
+AI: write('Hello World'), nl.
+USER: Напиши Hello World на Kotlin
+AI: fun main() = println("Hello World")
+USER: Напиши факторіал на Lua
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке бінарне дерево?
+AI: Кожен вузол має максимум 2 дітей. BST: ліве < корінь < праве. Пошук O(log n) в середньому.
+USER: Як написати Hello World в Prolog?
+AI: write('Hello World'), nl.
+USER: Що таке CSRF?
+AI: Атака де зловмисник змушує користувача виконати дію. Захист: CSRF токени, SameSite cookies.
+USER: Напиши Hello World на Haskell
+AI: main = putStrLn "Hello World"
+USER: Як написати Hello World в Ruby?
+AI: puts "Hello World"
+USER: Напиши факторіал на PHP
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке рекурсія?
+AI: Рекурсія — функція викликає себе. Потрібен базовий випадок, інакше буде stack overflow. Приклад: факторіал через рекурсію.
+USER: Що таке черга?
+AI: Черга FIFO. dodavaty в кінець, забирати з початку. Використовується в BFS.
+USER: Напиши факторіал на R
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши факторіал на JavaScript
+AI: function fact(n) { return n <= 1 ? 1 : n * fact(n-1) }
+USER: Як зробити факторіал в C#?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як написати Hello World в Swift?
+AI: print("Hello World")
+USER: Напиши калькулятор на TypeScript
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке XSS?
+AI: Атака через вставку скриптів у веб-сторінку. Захист: екранування HTML, Content-Security-Policy.
+USER: Напиши Hello World на C++
+AI: #include <iostream>
+int main() { std::cout << "Hello World"; return 0; }
+USER: Як зробити факторіал в Julia?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши Hello World на Java
+AI: public class Hello {
+  public static void main(String[] args) {
+    System.out.println("Hello World");
+  }
+}
+USER: Напиши факторіал на Ruby
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши факторіал на Haskell
+AI: fact 0 = 1
+fact n = n * fact (n-1)
+USER: Напиши Hello World на JavaScript
+AI: console.log("Hello World")
+USER: Напиши факторіал на Rust
+AI: fn fact(n: u64) -> u64 { if n <= 1 { 1 } else { n * fact(n-1) } }
+USER: Що таке хеш-таблиця?
+AI: Структура ключ-значення. Доступ O(1). В Python dict, в Java HashMap, в JS Map і Object.
+USER: Як зробити факторіал в Kotlin?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши Hello World на Swift
+AI: print("Hello World")
+USER: Напиши калькулятор на C++
+AI: double calc(double a, char op, double b) {
+  switch(op) {
+    case "+": return a+b; case "-": return a-b;
+    case "*": return a*b; case "/": return b ? a/b : 0;
+    default: return 0;
+  }
+}
+USER: Напиши факторіал на Swift
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке SQL?
+AI: Мова запитів до баз даних. SELECT FROM WHERE, JOIN, GROUP BY, ORDER BY. Розрізняють DDL, DML, DCL.
+USER: Що таке dependency injection?
+AI: Залежності передаються ззовні, не створюються всередині. Легше тестувати і змінювати.
+USER: Як зробити факторіал в Prolog?
+AI: fact(0, 1).
+fact(N, R) :- N > 0, N1 is N-1, fact(N1, R1), R is N * R1.
+USER: Що таке ООП?
+AI: Об'єктно-орієнтоване програмування. Чотири принципи: інкапсуляція, наслідування, поліморфізм, абстракція.
+USER: Як зробити факторіал в Java?
+AI: int fact(int n) { return n <= 1 ? 1 : n * fact(n-1); }
+USER: Як написати Hello World в Elixir?
+AI: IO.puts("Hello World")
+USER: Напиши факторіал на Kotlin
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке HTTP статуси?
+AI: 1xx інформація, 2xx успіх (200 OK), 3xx редирект, 4xx помилка клієнта (404 Not Found), 5xx помилка сервера (500).
+USER: Напиши калькулятор на Prolog
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Напиши Hello World на C#
+AI: using System;
+class Program { static void Main() { Console.WriteLine("Hello World"); } }
+USER: Напиши Hello World на Python
+AI: print("Hello World")
+USER: Напиши Hello World на TypeScript
+AI: console.log("Hello World")
+USER: Що таке Docker?
+AI: Контейнеризація. Dockerfile описує середовище, docker build збирає образ, docker run запускає контейнер.
+USER: Напиши калькулятор на Haskell
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Що таке граф?
+AI: Вузли (вершини) з'єднані ребрами. Орієнтований/неорієнтований. BFS/DFS обходи. Dijkstra для найкоротшого шляху.
+USER: Напиши факторіал на Scala
+AI: def fact(n: Int): Int = if (n <= 1) 1 else n * fact(n-1)
+USER: Що таке TCP/IP?
+AI: TCP надійна передача з'єднання (HTTP, FTP). IP маршрутизація пакетів між мережами.
+USER: Як зробити факторіал в Dart?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши факторіал на Julia
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як написати Hello World в SQL?
+AI: SELECT 'Hello World' AS greeting;
+USER: Напиши Hello World на Go
+AI: package main
+import "fmt"
+func main() { fmt.Println("Hello World") }
+USER: Як написати Hello World в PHP?
+AI: <?php echo "Hello World"; ?>
+USER: Що таке git?
+AI: Контроль версій. git init, add, commit, push, pull, branch, merge. GitHub для віддаленого зберігання.
+USER: Напиши калькулятор на R
+AI: function calc(a, op, b) { if (op == "+") return a+b; if (op == "-") return a-b; if (op == "*") return a*b; if (op == "/") return a/b }
+USER: Як зробити факторіал в Lua?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як зробити факторіал в Go?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Напиши калькулятор на Go
+AI: func calc(a, b float64, op string) float64 {
+  switch op {
+    case "+": return a+b; case "-": return a-b;
+    case "*": return a*b; case "/": if b != 0 { return a/b }
+  }
+  return 0
+}
+USER: Що таке REST?
+AI: Архітектура API. Ресурси з CRUD операціями: GET, POST, PUT, DELETE. Статуси 200, 201, 204, 400, 404.
+USER: Напиши факторіал на Python
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як зробити факторіал в Python?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Як зробити факторіал в Scala?
+AI: def fact(n: Int): Int = if (n <= 1) 1 else n * fact(n-1)
+USER: Напиши Hello World на R
+AI: cat("Hello World")
+USER: Як написати Hello World в C++?
+AI: #include <iostream>
+int main() { std::cout << "Hello World"; return 0; }
+USER: Як зробити факторіал в Ruby?
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
+USER: Що таке JSON?
+AI: Формат обміну даними: { 'key': 'value', 'num': 42, 'arr': [1,2,3] }. Легко читається, використовується в API.
+USER: Що таке linked list?
+AI: Вузли з даними і посиланням на наступний. Доступ O(n), але вставка/видалення O(1) в середині.
+USER: Як написати Hello World в Dart?
+AI: void main() { print("Hello World"); }
+USER: Напиши факторіал на C++
+AI: int fact(int n) { return n <= 1 ? 1 : n * fact(n-1); }
+USER: Як зробити факторіал в SQL?
+AI: WITH RECURSIVE fact(n,f) AS (SELECT 0,1 UNION ALL SELECT n+1, f*(n+1) FROM fact WHERE n<10) SELECT * FROM fact
+USER: Напиши калькулятор на Java
+AI: double calc(double a, String op, double b) {
+  switch(op) {
+    case "+": return a+b; case "-": return a-b;
+    case "*": return a*b; case "/": return b != 0 ? a/b : 0;
+    default: return 0;
+  }
+}
+USER: Що таке REST API?
+AI: API використовує HTTP методи. GET для отримання, POST для створення, PUT для оновлення, DELETE для видалення.
+USER: Як написати Hello World в Rust?
+AI: fn main() { println!("Hello World"); }
+USER: Напиши Hello World на PHP
+AI: <?php echo "Hello World"; ?>
+USER: Як написати Hello World в JavaScript?
+AI: console.log("Hello World")
+USER: Напиши факторіал на Go
+AI: def fact(n): return 1 if n <= 1 else n * fact(n-1)
