@@ -5,12 +5,24 @@
 #include "dense.h"
 #include "activations.h"
 
+static inline i32 checked_ffn_dim(i32 emb) {
+    if (emb <= 0 || emb % 4 != 0)
+        throw std::invalid_argument("TransformerBlock: embed_dim must be positive and divisible by 4");
+    if (emb > std::numeric_limits<i32>::max() / 4)
+        throw std::length_error("TransformerBlock: FFN dimension overflows i32");
+    return emb * 4;
+}
+
 struct PositionalEncoding {
     i32 max_len, dim;
 
-    PositionalEncoding(i32 ml, i32 d) : max_len(ml), dim(d) {}
+    PositionalEncoding(i32 ml, i32 d) : max_len(ml), dim(d) {
+        if (ml <= 0 || d <= 0) throw std::invalid_argument("PositionalEncoding: dimensions must be positive");
+    }
 
     Tensor forward(i32 T) {
+        if (T < 0 || T > max_len)
+            throw std::out_of_range("PositionalEncoding::forward: T out of range");
         Tensor pe(T, dim);
         for (i32 i = 0; i < T; i++) {
             for (i32 j = 0; j < dim; j++) {
@@ -35,7 +47,10 @@ struct TransformerBlock {
 
     TransformerBlock(i32 emb)
         : embed_dim(emb), attn(emb, 4, true), ln1(emb), ln2(emb),
-          ff1(emb, emb * 4, false), ff2(emb * 4, emb, false), act(Activation::GELU) {}
+          ff1(emb, checked_ffn_dim(emb), false), ff2(checked_ffn_dim(emb), emb, false), act(Activation::GELU) {
+        if (emb <= 0 || emb % 4 != 0)
+            throw std::invalid_argument("TransformerBlock: embed_dim must be positive and divisible by 4");
+    }
 
     Tensor forward(const Tensor& x) {
         last_x = x;

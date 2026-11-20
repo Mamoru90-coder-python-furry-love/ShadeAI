@@ -65,16 +65,17 @@ build\shade.exe --load <model.bin> "prompt"
 ### Тести
 
 ```
-tests/simd_check.cpp    — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
-tests/gradcheck.cpp     — central finite differences для Dense/LayerNorm/GRU/Attention
-tests/tensor_checks.cpp — runtime перевірки навіть при /DNDEBUG
-tests/bench.cpp         — scalar vs AVX: matmul/attention/AdamW
+tests/simd_check.cpp     — AVX vs scalar: exp/dot/softmax/matmul/attention/loss/AdamW
+tests/gradcheck.cpp      — central finite differences для Dense/LayerNorm/GRU/Attention, включно з h0
+tests/serialize_checks.cpp — обрізані/пошкоджені/з зайвими байтами checkpoint-и
+tests/tensor_checks.cpp  — runtime перевірки навіть при /DNDEBUG
+tests/bench.cpp          — scalar vs AVX: matmul/attention/AdamW
 ```
 
-Компіляція, наприклад:
+Зручна перевірка всього:
 
 ```
-cl /nologo /std:c++17 /O2 /arch:AVX /openmp /EHsc /I src tests\gradcheck.cpp /Fe:build\gradcheck.exe
+build\test.bat
 ```
 
 Останній результат `gradcheck` ( tolerance `2e-3` ):
@@ -82,7 +83,7 @@ cl /nologo /std:c++17 /O2 /arch:AVX /openmp /EHsc /I src tests\gradcheck.cpp /Fe
 ```
 Dense        OK  worst rel err 1.18e-05
 LayerNorm    OK  worst rel err 2.42e-05
-GRU          OK  worst rel err 1.45e-05
+GRU          OK  worst rel err 1.80e-05
 Attention    OK  worst rel err 2.55e-05
 ```
 
@@ -96,7 +97,15 @@ Attention    OK  worst rel err 2.55e-05
 - Attention backward: `dA = dO @ Vᵀ`, `dV = Aᵀ @ dO`.
 - LayerNorm backward: коректний `dx` з урахуванням `gamma`.
 - Tensor: neg dimensions, overflow `rows*cols`, bounds, matmul/broadcast mismatch — кидають винятки.
-- Serialization: перевірка кількості параметрів, всіх `fread`, розмірів і NaN/Inf.
+- Serialization: транзакційне завантаження — спершу читання в тимчасові буфери, потім перевірка всього файлу (включно з EOF) і тільки тоді заміна ваг. Відхиляються обрізані, NaN/отруєні, з зайвими байтами, з неправильною кількістю/формою параметрів файли. Те саме для optimizer state.
+- `Tensor::slice()`: перевірка `start + count` без переповнення.
+- Перевірки параметрів конструкторів і форм входу в Dense/LayerNorm/GRU/Attention/Transformer.
+
+### Ще не зроблено
+
+- `--load` у `gpt.cpp` все ще заглушка: потрібно зберегти/відновлювати tokenizer разом із моделлю й реалізувати повний inference.
+- Gradient checking не покриває весь TransformerBlock/Embedding/GRU в складі GPT.
+- Атомарний запис checkpoint-ів (temp file + rename) поки не реалізований; транзакційне **читання** вже є.
 
 ---
 

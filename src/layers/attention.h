@@ -15,6 +15,8 @@ struct SelfAttention {
         : embed_dim(emb), num_heads(heads), head_dim(emb / heads), causal(causal_),
           Wq(emb, emb), Wk(emb, emb), Wv(emb, emb), Wo(emb, emb),
           gWq(emb, emb, 0.0f), gWk(emb, emb, 0.0f), gWv(emb, emb, 0.0f), gWo(emb, emb, 0.0f) {
+        if (emb <= 0 || heads <= 0 || emb % heads != 0)
+            throw std::invalid_argument("SelfAttention: embed_dim must be positive and divisible by heads");
         f32 scale = std::sqrt(2.0f / emb);
         auto init = [&](Tensor& t) {
             for (i32 i = 0; i < t.size(); i++)
@@ -25,6 +27,8 @@ struct SelfAttention {
     }
 
     Tensor forward(const Tensor& x) {
+        if (x.cols != embed_dim)
+            throw std::invalid_argument("SelfAttention::forward: input width != embed_dim");
         last_x = x;
         i32 T = x.rows;
         last_q = x.matmul(Wq);
@@ -86,6 +90,8 @@ struct SelfAttention {
     }
 
     Tensor backward(const Tensor& dout) {
+        if (dout.rows != last_x.rows || dout.cols != embed_dim)
+            throw std::invalid_argument("SelfAttention::backward: dout shape does not match forward output");
         i32 T = dout.rows;
         // gWo = last_out^T @ dout  (outer product, parallelized over i)
 #ifdef _OPENMP

@@ -8,9 +8,12 @@ struct LayerNorm {
     f32 eps;
 
     LayerNorm(i32 d, f32 ep = 1e-5f) : dim(d), gamma(1, d, 1.0f), beta(1, d, 0.0f),
-        ggamma(1, d, 0.0f), gbeta(1, d, 0.0f), eps(ep) {}
+        ggamma(1, d, 0.0f), gbeta(1, d, 0.0f), eps(ep) {
+        if (d <= 0 || ep <= 0.0f) throw std::invalid_argument("LayerNorm: dim and eps must be positive");
+    }
 
     Tensor forward(const Tensor& x) {
+        if (x.cols != dim) throw std::invalid_argument("LayerNorm::forward: input width != dim");
         last_x = x;
         i32 B = x.rows;
         last_mean = Tensor(B, 1, 0.0f);
@@ -58,6 +61,8 @@ struct LayerNorm {
     }
 
     Tensor backward(const Tensor& dout) {
+        if (dout.rows != last_x.rows || dout.cols != dim)
+            throw std::invalid_argument("LayerNorm::backward: dout shape does not match forward output");
         i32 B = dout.rows;
         ggamma.fill(0.0f); gbeta.fill(0.0f);
         Tensor dx(B, dim, 0.0f);

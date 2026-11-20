@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #if defined(__AVX__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -37,6 +38,10 @@ struct Tensor {
         if (d.size() != (size_t)checked_size(r, c))
             throw std::invalid_argument("Tensor: data size does not match rows * cols");
     }
+    Tensor(i32 r, i32 c, std::vector<f32>&& d) : rows(r), cols(c), data(std::move(d)) {
+        if (data.size() != (size_t)checked_size(r, c))
+            throw std::invalid_argument("Tensor: data size does not match rows * cols");
+    }
 
     void check_bounds(i32 r, i32 c) const {
         if (r < 0 || r >= rows || c < 0 || c >= cols)
@@ -49,7 +54,7 @@ struct Tensor {
     void fill(f32 v) { std::fill(data.begin(), data.end(), v); }
     Tensor clone() const { return Tensor(rows, cols, data); }
     Tensor slice(i32 start, i32 count) const {
-        if (start < 0 || count < 0 || start + count > rows)
+        if (start < 0 || count < 0 || start > rows - count)
             throw std::out_of_range("Tensor::slice: range out of bounds");
         Tensor r(count, cols);
         for (i32 i = 0; i < count; i++)

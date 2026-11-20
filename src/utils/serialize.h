@@ -2,9 +2,13 @@
 #include "../core/tensor.h"
 #include <vector>
 #include <string>
+#include <cstdio>
+#include <cstdint>
+#include <limits>
 #include <fstream>
 #include <thread>
 #include <mutex>
+#include <utility>
 
 namespace Serialize {
 
@@ -21,100 +25,156 @@ inline bool has_naninf(const float* data, i32 n) {
 }
 inline bool has_naninf_tensor(const Tensor& t) { return has_naninf(t.data.data(), (i32)t.size()); }
 
-bool save(const std::string& path, const std::vector<Tensor*>& params) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    i32 n = (i32)params.size();
-    fwrite(&n, sizeof(i32), 1, f);
-    for (auto* p : params) {
-        fwrite(&p->rows, sizeof(i32), 1, f);
-        fwrite(&p->cols, sizeof(i32), 1, f);
-        fwrite(p->data.data(), sizeof(f32), p->size(), f);
-    }
-    fclose(f);
+namespace detail {
+
+inline bool valid_shape(i32 r, i32 c) {
+    if (r < 0 || c < 0) return false;
+    return r == 0 || c <= std::numeric_limits<i32>::max() / r;
+}
+
+inline bool read_exact(FILE* f, void* dst, size_t bytes) {
+    return bytes == 0 || fread(dst, 1, bytes, f) == bytes;
+}
+inline bool write_exact(FILE* f, const void* src, size_t bytes) {
+    return bytes == 0 || fwrite(src, 1, bytes, f) == bytes;
+}
+
+inline bool read_i32(FILE* f, i32& v) { return read_exact(f, &v, sizeof(v)); }
+inline bool write_i32(FILE* f, i32 v) { return write_exact(f, &v, sizeof(v)); }
+
+// Read one tensor block into a temporary. Nothing touches the model tensors.
+inline bool read_tensor(FILE* f, Tensor& out, i32 expected_rows = -1, i32 expected_cols = -1) {
+    i32 r, c;
+    if (!read_i32(f, r) || !read_i32(f, c)) return false;
+    if (!valid_shape(r, c)) return false;
+    if (expected_rows >= 0 && (r != expected_rows || c != expected_cols)) return false;
+
+    const size_t n = (size_t)r * (size_t)c;
+    std::vector<f32> d(n);
+    if (n && !read_exact(f, d.data(), n * sizeof(f32))) return false;
+    if (has_naninf(d.data(), (i32)n)) return false;
+    out = Tensor(r, c, std::move(d));
     return true;
 }
 
+inline bool write_tensor(FILE* f, const Tensor& t) {
+    return write_i32(f, t.rows) && write_i32(f, t.cols)
+        && write_exact(f, t.data.data(), (size_t)t.size() * sizeof(f32));
+}
+
+// Reject both truncation and trailing garbage after the expected payload.
+inline bool at_eof(FILE* f) { return fgetc(f) == EOF && !ferror(f); }
+
+// Vector move assignment is noexcept for the default allocator, so this cannot
+// partially update the model after every block has been validated.
+inline void commit(std::vector<Tensor>& staged, const std::vector<Tensor*>& params) {
+    for (size_t i = 0; i < params.size(); i++) params[i]->data = std::move(staged[i].data);
+}
+
+} // namespace detail
+
+bool save(const std::string& path, const std::vector<Tensor*>& params) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = detail::write_i32(f, (i32)params.size());
+    for (auto* p : params) {
+        if (!ok) break;
+        ok = detail::write_tensor(f, *p);
+    }
+    if (fclose(f) != 0) ok = false;
+    return ok;
+}
+
+// Transactional: on any read/shape/NaN failure the target tensors are untouched.
 bool load(const std::string& path, const std::vector<Tensor*>& params) {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
-    i32 n;
-    if (fread(&n, sizeof(i32), 1, f) != 1 || n != (i32)params.size()) { fclose(f); return false; }
-    for (i32 i = 0; i < n; i++) {
-        i32 r, c;
-        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1) {
-            fclose(f);
-            return false;
+
+    bool ok = false;
+    do {
+        i32 n;
+        if (!detail::read_i32(f, n) || n < 0 || n != (i32)params.size()) break;
+
+        std::vector<Tensor> staged;
+        staged.reserve(n);
+        for (i32 i = 0; i < n; i++) {
+            Tensor t;
+            if (!detail::read_tensor(f, t, params[i]->rows, params[i]->cols)) break;
+            staged.push_back(std::move(t));
         }
-        if (params[i]->rows != r || params[i]->cols != c) {
-            fclose(f);
-            return false;
-        }
-        if (fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f) != (size_t)params[i]->size()) {
-            fclose(f);
-            return false;
-        }
-    }
+        if ((i32)staged.size() != n || !detail::at_eof(f)) break;
+
+        detail::commit(staged, params);
+        ok = true;
+    } while (false);
+
     fclose(f);
-    return true;
+    return ok;
 }
 
 bool save_model(const std::string& path, const std::vector<Tensor*>& params, i32 dim, i32 blocks, i32 ctx) {
     // Never persist a poisoned (NaN/Inf/exploded) model — it would permanently destroy the good one.
+    if (dim <= 0 || blocks <= 0 || ctx <= 0) return false;
     for (auto* p : params) if (has_naninf_tensor(*p)) return false;
+
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return false;
-    i32 magic = 0x53484445; // "SHDE"
-    i32 header[4] = { magic, dim, blocks, ctx };
-    fwrite(header, sizeof(i32), 4, f);
-    i32 n = (i32)params.size();
-    fwrite(&n, sizeof(i32), 1, f);
+    const i32 header[4] = { 0x53484445, dim, blocks, ctx }; // "SHDE"
+    bool ok = detail::write_exact(f, header, sizeof(header))
+           && detail::write_i32(f, (i32)params.size());
     for (auto* p : params) {
-        fwrite(&p->rows, sizeof(i32), 1, f);
-        fwrite(&p->cols, sizeof(i32), 1, f);
-        fwrite(p->data.data(), sizeof(f32), p->size(), f);
+        if (!ok) break;
+        ok = detail::write_tensor(f, *p);
     }
-    fclose(f);
-    return true;
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
+// Transactional: `info.valid` is false and no weights change unless the whole
+// file (header, count, every block, EOF) validates.
 ModelInfo load_model(const std::string& path, const std::vector<Tensor*>& params) {
-    ModelInfo info = { 0, 0, 0, false };
+    const ModelInfo bad = { 0, 0, 0, false };
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return info;
-    i32 header[4];
-    if (fread(header, sizeof(i32), 4, f) != 4) { fclose(f); return info; }
-    if (header[0] != 0x53484445) { fclose(f); return info; }
-    info = { header[1], header[2], header[3], true };
-    i32 n;
-    if (fread(&n, sizeof(i32), 1, f) != 1 || n != (i32)params.size()) {
-        fclose(f); info.valid = false; return info;
-    }
-    for (i32 i = 0; i < n; i++) {
-        i32 r, c;
-        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1 ||
-            params[i]->rows != r || params[i]->cols != c) {
-            fclose(f); info.valid = false; return info;
+    if (!f) return bad;
+
+    ModelInfo info = bad;
+    do {
+        i32 header[4];
+        if (!detail::read_exact(f, header, sizeof(header)) || header[0] != 0x53484445) break;
+        if (header[1] <= 0 || header[2] <= 0 || header[3] <= 0) break;
+
+        i32 n;
+        if (!detail::read_i32(f, n) || n < 0 || n != (i32)params.size()) break;
+
+        std::vector<Tensor> staged;
+        staged.reserve(n);
+        for (i32 i = 0; i < n; i++) {
+            Tensor t;
+            if (!detail::read_tensor(f, t, params[i]->rows, params[i]->cols)) break;
+            staged.push_back(std::move(t));
         }
-        if (fread(params[i]->data.data(), sizeof(f32), params[i]->size(), f) != (size_t)params[i]->size()) {
-            fclose(f); info.valid = false; return info;
-        }
-        if (has_naninf_tensor(*params[i])) { fclose(f); info.valid = false; return info; }   // poisoned checkpoint
-    }
+        if ((i32)staged.size() != n || !detail::at_eof(f)) break;
+
+        detail::commit(staged, params);
+        info = { header[1], header[2], header[3], true };
+    } while (false);
+
     fclose(f);
     return info;
 }
 
 ModelInfo read_model_info(const std::string& path) {
-    ModelInfo info = { 0, 0, 0, false };
+    const ModelInfo bad = { 0, 0, 0, false };
     FILE* f = fopen(path.c_str(), "rb");
-    if (!f) return info;
+    if (!f) return bad;
     i32 header[4];
-    if (fread(header, sizeof(i32), 4, f) != 4) { fclose(f); return info; }
-    if (header[0] != 0x53484445) { fclose(f); return info; }
-    info = { header[1], header[2], header[3], true };
+    if (!detail::read_exact(f, header, sizeof(header)) || header[0] != 0x53484445) {
+        fclose(f);
+        return bad;
+    }
     fclose(f);
-    return info;
+    if (header[1] <= 0 || header[2] <= 0 || header[3] <= 0) return bad;
+    return { header[1], header[2], header[3], true };
 }
 
 // ---- AdamW optimizer state (m, v moments) persistence for smooth resume ----
@@ -122,45 +182,58 @@ ModelInfo read_model_info(const std::string& path) {
 // one block for m's then one for v's, then the adam step counter t.
 bool save_optimizer(const std::string& path,
                     const std::vector<Tensor*>& m, const std::vector<Tensor*>& v, i32 t) {
-    if (m.size() != v.size()) return false;
+    if (m.size() != v.size() || t < 0) return false;
     for (auto* p : m) if (has_naninf_tensor(*p)) return false;
     for (auto* p : v) if (has_naninf_tensor(*p)) return false;
+
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) return false;
-    i32 n = (i32)m.size();
-    fwrite(&n, sizeof(i32), 1, f);
-    for (auto* p : m) { fwrite(&p->rows, sizeof(i32), 1, f); fwrite(&p->cols, sizeof(i32), 1, f); fwrite(p->data.data(), sizeof(f32), p->size(), f); }
-    for (auto* p : v) { fwrite(&p->rows, sizeof(i32), 1, f); fwrite(&p->cols, sizeof(i32), 1, f); fwrite(p->data.data(), sizeof(f32), p->size(), f); }
-    fwrite(&t, sizeof(i32), 1, f);
-    fclose(f);
-    return true;
+    bool ok = detail::write_i32(f, (i32)m.size());
+    for (auto* p : m) { if (!ok) break; ok = detail::write_tensor(f, *p); }
+    for (auto* p : v) { if (!ok) break; ok = detail::write_tensor(f, *p); }
+    if (ok) ok = detail::write_i32(f, t);
+    if (fclose(f) != 0) ok = false;
+    return ok;
 }
 
+// Transactional: m, v and t are committed only after every block and EOF validate.
 bool load_optimizer(const std::string& path,
                     const std::vector<Tensor*>& m, const std::vector<Tensor*>& v, i32& t) {
     if (m.size() != v.size()) return false;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
-    i32 n;
-    if (fread(&n, sizeof(i32), 1, f) != 1) { fclose(f); return false; }
-    if ((i32)n != (i32)m.size()) { fclose(f); return false; }
-    for (i32 i = 0; i < n; i++) {
-        i32 r, c;
-        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1) { fclose(f); return false; }
-        if (m[i]->rows != r || m[i]->cols != c) { fclose(f); return false; }
-        if (fread(m[i]->data.data(), sizeof(f32), m[i]->size(), f) != (size_t)m[i]->size()) { fclose(f); return false; }
-        if (has_naninf_tensor(*m[i])) { fclose(f); return false; }   // poisoned optimizer state
-    }
-    for (i32 i = 0; i < n; i++) {
-        i32 r, c;
-        if (fread(&r, sizeof(i32), 1, f) != 1 || fread(&c, sizeof(i32), 1, f) != 1) { fclose(f); return false; }
-        if (v[i]->rows != r || v[i]->cols != c) { fclose(f); return false; }
-        if (fread(v[i]->data.data(), sizeof(f32), v[i]->size(), f) != (size_t)v[i]->size()) { fclose(f); return false; }
-        if (has_naninf_tensor(*v[i])) { fclose(f); return false; }   // poisoned optimizer state
-    }
-    if (fread(&t, sizeof(i32), 1, f) != 1) { fclose(f); return false; }
+
+    bool ok = false;
+    do {
+        i32 n;
+        if (!detail::read_i32(f, n) || n < 0 || n != (i32)m.size()) break;
+
+        std::vector<Tensor> sm, sv;
+        sm.reserve(n); sv.reserve(n);
+        bool blocks_ok = true;
+        for (i32 i = 0; i < n && blocks_ok; i++) {
+            Tensor tmp;
+            blocks_ok = detail::read_tensor(f, tmp, m[i]->rows, m[i]->cols);
+            if (blocks_ok) sm.push_back(std::move(tmp));
+        }
+        for (i32 i = 0; i < n && blocks_ok; i++) {
+            Tensor tmp;
+            blocks_ok = detail::read_tensor(f, tmp, v[i]->rows, v[i]->cols);
+            if (blocks_ok) sv.push_back(std::move(tmp));
+        }
+        if (!blocks_ok) break;
+
+        i32 new_t;
+        if (!detail::read_i32(f, new_t) || new_t < 0 || !detail::at_eof(f)) break;
+
+        detail::commit(sm, m);
+        detail::commit(sv, v);
+        t = new_t;
+        ok = true;
+    } while (false);
+
     fclose(f);
-    return true;
+    return ok;
 }
 
 // ---- async (threaded) checkpoint writer ----

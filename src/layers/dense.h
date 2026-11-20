@@ -14,6 +14,7 @@ struct Dense {
           w(in_d, out_d), b(1, out_d, 0.0f),
           gw(in_d, out_d, 0.0f), gb(1, out_d, 0.0f),
           wT(out_d, in_d, 0.0f) {
+        if (in_d <= 0 || out_d <= 0) throw std::invalid_argument("Dense: dimensions must be positive");
         // Xavier init
         f32 scale = std::sqrt(2.0f / (in_d + out_d));
         for (i32 i = 0; i < w.size(); i++)
@@ -24,6 +25,7 @@ struct Dense {
     }
 
     Tensor forward(const Tensor& x) {
+        if (x.cols != in_dim) throw std::invalid_argument("Dense::forward: input width != in_dim");
         last_input = x;
         last_output = x.matmul(w).add(b);
         if (use_relu)
@@ -33,6 +35,8 @@ struct Dense {
     }
 
     Tensor backward(const Tensor& dout) {
+        if (dout.rows != last_input.rows || dout.cols != out_dim)
+            throw std::invalid_argument("Dense::backward: dout shape does not match forward output");
         // refresh cached transpose from current w (w is not modified during backward)
         for (i32 i = 0; i < in_dim; i++) {
             const f32* wp = &w.data[i * out_dim];

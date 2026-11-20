@@ -21,6 +21,7 @@ struct GRU {
           gWz(in_d, hid_d, 0.0f), gWr(in_d, hid_d, 0.0f), gWn(in_d, hid_d, 0.0f),
           gUz(hid_d, hid_d, 0.0f), gUr(hid_d, hid_d, 0.0f), gUn(hid_d, hid_d, 0.0f),
           gbz(1, hid_d, 0.0f), gbr(1, hid_d, 0.0f), gbn(1, hid_d, 0.0f) {
+        if (in_d <= 0 || hid_d <= 0) throw std::invalid_argument("GRU: dimensions must be positive");
         f32 scale = std::sqrt(2.0f / (in_d + hid_d));
         auto init = [&](Tensor& t) {
             for (i32 i = 0; i < t.size(); i++)
@@ -31,6 +32,9 @@ struct GRU {
     }
 
     Tensor forward(const Tensor& x, const Tensor& h0) {
+        if (x.cols != in_dim) throw std::invalid_argument("GRU::forward: input width != in_dim");
+        if (h0.rows != 1 || h0.cols != hidden_dim)
+            throw std::invalid_argument("GRU::forward: h0 must be 1 x hidden_dim");
         last_x = x; last_h0 = h0;
         i32 T = x.rows;
         xs.clear(); zs.clear(); rs.clear(); ns.clear(); hs.clear();
@@ -77,7 +81,9 @@ struct GRU {
         return out;
     }
 
-    Tensor backward(const Tensor& dh) {
+    Tensor backward(const Tensor& dh, Tensor* dh0 = nullptr) {
+        if (dh.rows != last_x.rows || dh.cols != hidden_dim)
+            throw std::invalid_argument("GRU::backward: dh shape does not match forward output");
         // dh: T x hidden_dim, gradients for each output timestep
         // Gradients accumulate (zero_grad before epoch)
 
@@ -180,6 +186,10 @@ struct GRU {
             }
         }
 
+        if (dh0) {
+            *dh0 = Tensor(1, hidden_dim);
+            for (i32 j = 0; j < hidden_dim; j++) dh0->data[j] = dh_next.data[j];
+        }
         return dx;
     }
 

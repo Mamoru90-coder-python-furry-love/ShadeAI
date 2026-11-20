@@ -54,19 +54,23 @@ static bool gradcheck(const std::string& name,
     Tensor target = random_tensor(out.rows, out.cols);
     Tensor dout;
     mse(out, target, &dout);
-    Tensor dx = backward(dout);
+    std::vector<Tensor> input_grads;
+    backward(dout, input_grads);
+    if (input_grads.size() != inputs.size()) {
+        std::fprintf(stderr, "%s: backward returned %zu input grads, expected %zu\n",
+                     name.c_str(), input_grads.size(), inputs.size());
+        return false;
+    }
 
     std::vector<std::vector<f32>> analytic;
     for (auto* g : grads) analytic.push_back(g->data);
+    std::vector<std::vector<f32>> analytic_input;
+    for (auto& g : input_grads) analytic_input.push_back(g.data);
 
     f32 worst = 0;
     std::string worst_at;
-    auto compare = [&](f32 num, f32 ana, const std::string& at) {
-        f32 err = std::fabs(num - ana) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(ana)));
-        if (err > worst) { worst = err; worst_at = at; }
-    };
 
-    auto numeric = [&](Tensor& p, i32 idx, f32 base) {
+    auto numeric = [&](Tensor& p, i32 idx) {
         f32 orig = p.data[idx];
         p.data[idx] = orig + eps;
         f32 lp = mse(forward(), target, nullptr);
@@ -82,7 +86,7 @@ static bool gradcheck(const std::string& name,
             f32 group_worst = 0;
             std::string group_at;
             for (i32 i = 0; i < list[k]->size(); i++) {
-                f32 num = numeric(*list[k], i, 0.0f);
+                f32 num = numeric(*list[k], i);
                 f32 a = ana[k][i];
                 f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
                 if (err > group_worst) { group_worst = err; group_at = std::to_string(i); }
@@ -94,7 +98,7 @@ static bool gradcheck(const std::string& name,
     };
 
     sweep(params, "param", analytic);
-    sweep(inputs, "input", { dx.data });
+    sweep(inputs, "input", analytic_input);
 
     bool ok = worst <= tol;
     std::printf("%-12s %s  worst rel err %.3e at %s\n",
@@ -112,7 +116,7 @@ int main() {
         Tensor x = random_tensor(5, 4);
         ok &= gradcheck("Dense",
             [&] { return fc.forward(x); },
-            [&](const Tensor& dout) { return fc.backward(dout); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) { ig.push_back(fc.backward(dout)); },
             {&fc.w, &fc.b}, {&fc.gw, &fc.gb}, {&x});
     }
 
@@ -122,7 +126,7 @@ int main() {
         Tensor x = random_tensor(4, 5);
         ok &= gradcheck("LayerNorm",
             [&] { return ln.forward(x); },
-            [&](const Tensor& dout) { return ln.backward(dout); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) { ig.push_back(ln.backward(dout)); },
             {&ln.gamma, &ln.beta}, {&ln.ggamma, &ln.gbeta}, {&x});
     }
 
@@ -133,8 +137,12 @@ int main() {
         Tensor h0 = random_tensor(1, 3);
         ok &= gradcheck("GRU",
             [&] { return gru.forward(x, h0); },
-            [&](const Tensor& dout) { return gru.backward(dout); },
-            gru.params(), gru.grads(), {&x});
+            [&](const Tensor& dout, std::vector<Tensor>& ig) {
+                Tensor dh0;
+                ig.push_back(gru.backward(dout, &dh0));
+                ig.push_back(std::move(dh0));
+            },
+            gru.params(), gru.grads(), {&x, &h0});
     }
 
     {
@@ -143,7 +151,7 @@ int main() {
         Tensor x = random_tensor(4, 6);
         ok &= gradcheck("Attention",
             [&] { return att.forward(x); },
-            [&](const Tensor& dout) { return att.backward(dout); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) { ig.push_back(att.backward(dout)); },
             att.params(), att.grads(), {&x});
     }
 
