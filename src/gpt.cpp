@@ -423,15 +423,6 @@ static bool gpt_compute_file_crc(FILE* f, uint32_t& out) {
     return true;
 }
 
-static bool atomic_replace(const std::string& tmp, const std::string& dst) {
-#ifdef _WIN32
-    return MoveFileExA(tmp.c_str(), dst.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
-#else
-    return std::rename(tmp.c_str(), dst.c_str()) == 0;
-#endif
-}
-
 bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     using namespace Serialize::detail;
     // Write to a sibling temp file first. The previous good checkpoint stays
@@ -468,7 +459,7 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
         if (ok) ok = gpt_write_u32(f, crc);
     }
     if (fclose(f) != 0) ok = false;
-    if (!ok || !atomic_replace(tmp, path)) {
+    if (!ok || !Serialize::detail::atomic_replace(tmp, path)) {
         std::remove(tmp.c_str());
         return false;
     }

@@ -44,6 +44,132 @@ static bool append_garbage(const fs::path& src, const fs::path& dst) {
     return write_all(dst, data);
 }
 
+// Atomic publishing: a failed/interrupted write must never touch the previous
+// good checkpoint, and AsyncSaver must survive back-to-back spawns.
+static int atomic_and_async_checks() {
+    const fs::path dir = fs::temp_directory_path();
+    const fs::path model = dir / "shade_atomic_model.bin";
+    const fs::path opt = dir / "shade_atomic_opt.bin";
+    const fs::path amodel = dir / "shade_async_model.bin";
+    const fs::path aopt = dir / "shade_async_opt.bin";
+    const fs::path model_tmp(model.string() + ".tmp"), opt_tmp(opt.string() + ".tmp");
+    const fs::path amodel_tmp(amodel.string() + ".tmp"), aopt_tmp(aopt.string() + ".tmp");
+    for (const auto& p : { model, opt, amodel, aopt, model_tmp, opt_tmp, amodel_tmp, aopt_tmp })
+        fs::remove(p);
+
+    bool ok = true;
+    auto expect = [&](bool cond, const char* what) {
+        if (!cond) { std::fprintf(stderr, "FAIL: %s\n", what); ok = false; }
+    };
+
+    Tensor a(2, 3);
+    for (i32 i = 0; i < a.size(); i++) a.data[i] = (f32)(i + 1);
+    std::vector<Tensor*> params{ &a };
+
+    // Successful save publishes through a temp file and leaves none behind.
+    expect(Serialize::save_model(model.string(), params, 4, 2, 16), "atomic save_model");
+    expect(!fs::exists(model_tmp), "no temp after successful save");
+    const auto good_model = read_all(model);
+
+    // A stale temp from an interrupted write cannot corrupt the good file.
+    expect(write_all(model_tmp, { 'x', 'x', 'x' }), "leave stale temp");
+    Tensor check(2, 3); fill(check, -7.0f);
+    auto info = Serialize::load_model(model.string(), { &check });
+    expect(info.valid && same(a, check), "stale temp does not affect checkpoint");
+    fs::remove(model_tmp);
+
+    // Blocked temp path: the save fails and the old bytes/old model survive.
+    fs::create_directory(model_tmp);
+    a.data[0] = 99.0f;
+    expect(!Serialize::save_model(model.string(), params, 4, 2, 16), "save_model fails when temp blocked");
+    expect(read_all(model) == good_model, "old bytes survive failed save");
+    fill(check, -7.0f);
+    info = Serialize::load_model(model.string(), { &check });
+    expect(info.valid && check.data[0] == 1.0f, "old model loadable after failed save");
+    fs::remove(model_tmp);
+    a.data[0] = 1.0f;
+
+    // Poisoned tensors are refused before any file is touched.
+    a.data[0] = std::numeric_limits<f32>::quiet_NaN();
+    expect(!Serialize::save_model(model.string(), params, 4, 2, 16), "poisoned model refused");
+    expect(read_all(model) == good_model, "poisoned save leaves old bytes intact");
+    a.data[0] = 1.0f;
+
+    // Optimizer sidecar: same publish contract.
+    Tensor m(2, 3), v(2, 3);
+    fill(m, 0.25f); fill(v, 0.5f);
+    std::vector<Tensor*> ms{ &m }, vs{ &v };
+    expect(Serialize::save_optimizer(opt.string(), ms, vs, 7), "atomic save_optimizer");
+    expect(!fs::exists(opt_tmp), "no optimizer temp after successful save");
+    const auto good_opt = read_all(opt);
+    fs::create_directory(opt_tmp);
+    fill(m, 9.0f);
+    expect(!Serialize::save_optimizer(opt.string(), ms, vs, 8), "save_optimizer fails when temp blocked");
+    expect(read_all(opt) == good_opt, "old optimizer bytes survive failed save");
+    fs::remove(opt_tmp);
+    fill(m, 0.25f);
+
+    // AsyncSaver: two back-to-back spawns must join the previous writer instead
+    // of assigning to a joinable std::thread (which calls std::terminate).
+    {
+        Serialize::AsyncSaver saver(amodel.string(), aopt.string());
+        Tensor w(2, 3); fill(w, 3.0f);
+        std::vector<Tensor*> wp{ &w };
+
+        saver.queue_model(wp, 4, 2, 16);
+        saver.spawn();
+        fill(w, 5.0f);
+        saver.queue_model(wp, 4, 2, 16);
+        saver.spawn();
+        saver.flush(); // process surviving is the negative control for terminate
+
+        Tensor got(2, 3); fill(got, -7.0f);
+        info = Serialize::load_model(amodel.string(), { &got });
+        expect(info.valid && info.dim == 4 && info.blocks == 2 && info.ctx == 16,
+               "async model info");
+        expect(got.data[0] == 5.0f, "async second snapshot published");
+        expect(!fs::exists(amodel_tmp), "no async temp left behind");
+
+        // NaN snapshot: keep the last good checkpoint.
+        fill(w, std::numeric_limits<f32>::quiet_NaN());
+        saver.queue_model(wp, 4, 2, 16);
+        saver.spawn(); saver.flush();
+        fill(got, -7.0f);
+        info = Serialize::load_model(amodel.string(), { &got });
+        expect(info.valid && got.data[0] == 5.0f, "NaN snapshot keeps last good model");
+
+        // Failed model publish must not advance the optimizer sidecar alone.
+        const auto opt_before = fs::exists(aopt) ? read_all(aopt) : std::vector<char>{};
+        fs::create_directory(amodel_tmp);
+        fill(w, 8.0f);
+        saver.queue_model(wp, 4, 2, 16);
+        saver.queue_opt(ms, vs, 21);
+        saver.spawn(); saver.flush();
+        expect(!fs::exists(aopt) || read_all(aopt) == opt_before,
+               "failed model save does not publish optimizer alone");
+        fs::remove(amodel_tmp);
+
+        // Happy path with optimizer: SHDE model + sidecar round-trip.
+        saver.queue_model(wp, 4, 2, 16);
+        saver.queue_opt(ms, vs, 33);
+        saver.spawn(); saver.flush();
+        fill(got, -7.0f);
+        info = Serialize::load_model(amodel.string(), { &got });
+        expect(info.valid && got.data[0] == 8.0f, "async model+opt model load");
+        Tensor dm(2, 3), dv(2, 3);
+        i32 t = 0;
+        expect(Serialize::load_optimizer(aopt.string(), { &dm }, { &dv }, t), "async optimizer load");
+        expect(t == 33 && dm.data[0] == 0.25f && dv.data[0] == 0.5f, "async optimizer values");
+    }
+
+    for (const auto& p : { model, opt, amodel, aopt, model_tmp, opt_tmp, amodel_tmp, aopt_tmp })
+        fs::remove(p);
+
+    if (!ok) { std::fprintf(stderr, "atomic_checks: FAILED\n"); return 1; }
+    std::puts("atomic_checks: OK");
+    return 0;
+}
+
 int main() {
     const fs::path dir = fs::temp_directory_path();
     const fs::path model = dir / "shade_check_model.bin";
@@ -134,6 +260,7 @@ int main() {
            "optimizer failure leaves state unchanged");
 
     for (const auto& p : { model, bad, plain, opt }) fs::remove(p);
+    if (atomic_and_async_checks() != 0) ok = false;
 
     if (!ok) { std::fprintf(stderr, "serialize_checks: FAILED\n"); return 1; }
     std::puts("serialize_checks: OK");

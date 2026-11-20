@@ -1,4 +1,13 @@
 #pragma once
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "../core/tensor.h"
 #include <vector>
 #include <string>
@@ -68,6 +77,35 @@ inline bool write_tensor(FILE* f, const Tensor& t) {
 // Reject both truncation and trailing garbage after the expected payload.
 inline bool at_eof(FILE* f) { return fgetc(f) == EOF && !ferror(f); }
 
+// Atomic publish: write a sibling temp file, then replace the destination in
+// one operation. The previous good file stays intact until the new payload is
+// complete, so a crash/interruption cannot leave a truncated checkpoint.
+inline bool atomic_replace(const std::string& tmp, const std::string& dst) {
+#ifdef _WIN32
+    return MoveFileExA(tmp.c_str(), dst.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(tmp.c_str(), dst.c_str()) == 0;
+#endif
+}
+
+// writer returns the payload status. On any failure the temp file is removed
+// and the destination is never touched.
+template <typename Writer>
+inline bool write_atomic(const std::string& path, Writer writer) {
+    const std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "w+b");
+    if (!f) return false;
+    bool ok = writer(f);
+    if (ok && fflush(f) != 0) ok = false;
+    if (fclose(f) != 0) ok = false;
+    if (!ok || !atomic_replace(tmp, path)) {
+        std::remove(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 // Vector move assignment is noexcept for the default allocator, so this cannot
 // partially update the model after every block has been validated.
 inline void commit(std::vector<Tensor>& staged, const std::vector<Tensor*>& params) {
@@ -77,15 +115,14 @@ inline void commit(std::vector<Tensor>& staged, const std::vector<Tensor*>& para
 } // namespace detail
 
 bool save(const std::string& path, const std::vector<Tensor*>& params) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    bool ok = detail::write_i32(f, (i32)params.size());
-    for (auto* p : params) {
-        if (!ok) break;
-        ok = detail::write_tensor(f, *p);
-    }
-    if (fclose(f) != 0) ok = false;
-    return ok;
+    return detail::write_atomic(path, [&](FILE* f) {
+        bool ok = detail::write_i32(f, (i32)params.size());
+        for (auto* p : params) {
+            if (!ok) break;
+            ok = detail::write_tensor(f, *p);
+        }
+        return ok;
+    });
 }
 
 // Transactional: on any read/shape/NaN failure the target tensors are untouched.
@@ -120,17 +157,16 @@ bool save_model(const std::string& path, const std::vector<Tensor*>& params, i32
     if (dim <= 0 || blocks <= 0 || ctx <= 0) return false;
     for (auto* p : params) if (has_naninf_tensor(*p)) return false;
 
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    const i32 header[4] = { 0x53484445, dim, blocks, ctx }; // "SHDE"
-    bool ok = detail::write_exact(f, header, sizeof(header))
-           && detail::write_i32(f, (i32)params.size());
-    for (auto* p : params) {
-        if (!ok) break;
-        ok = detail::write_tensor(f, *p);
-    }
-    if (fclose(f) != 0) ok = false;
-    return ok;
+    return detail::write_atomic(path, [&](FILE* f) {
+        const i32 header[4] = { 0x53484445, dim, blocks, ctx }; // "SHDE"
+        bool ok = detail::write_exact(f, header, sizeof(header))
+               && detail::write_i32(f, (i32)params.size());
+        for (auto* p : params) {
+            if (!ok) break;
+            ok = detail::write_tensor(f, *p);
+        }
+        return ok;
+    });
 }
 
 // Transactional: `info.valid` is false and no weights change unless the whole
@@ -189,14 +225,13 @@ bool save_optimizer(const std::string& path,
     for (auto* p : m) if (has_naninf_tensor(*p)) return false;
     for (auto* p : v) if (has_naninf_tensor(*p)) return false;
 
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) return false;
-    bool ok = detail::write_i32(f, (i32)m.size());
-    for (auto* p : m) { if (!ok) break; ok = detail::write_tensor(f, *p); }
-    for (auto* p : v) { if (!ok) break; ok = detail::write_tensor(f, *p); }
-    if (ok) ok = detail::write_i32(f, t);
-    if (fclose(f) != 0) ok = false;
-    return ok;
+    return detail::write_atomic(path, [&](FILE* f) {
+        bool ok = detail::write_i32(f, (i32)m.size());
+        for (auto* p : m) { if (!ok) break; ok = detail::write_tensor(f, *p); }
+        for (auto* p : v) { if (!ok) break; ok = detail::write_tensor(f, *p); }
+        if (ok) ok = detail::write_i32(f, t);
+        return ok;
+    });
 }
 
 // Transactional: m, v and t are committed only after every block and EOF validate.
@@ -240,19 +275,27 @@ bool load_optimizer(const std::string& path,
 }
 
 // ---- async (threaded) checkpoint writer ----
-// Captures a deep copy of model + AdamW moments in the main thread (fast, ~tens of ms),
-// then writes everything to disk on a detached background thread so the HDD fsync never
-// blocks the training loop. A tiny mutex guards the "next snapshot" slot so saves never overlap.
+// NOTE: the files written here use the legacy SHDE layout from save_model /
+// save_optimizer. They are NOT the self-contained v2 GPT checkpoint written by
+// save_gpt() (SHDG magic + version + tokenizer + CRC). Do not point these paths
+// at a GPT checkpoint unless its loader understands this format.
+// Paths are configurable so callers (and tests) do not depend on a fixed ../model dir.
 struct AsyncSaver {
     struct Buf { std::vector<Tensor> model; std::vector<Tensor> m, v; i32 dim=0, blocks=0, ctx=0, t=0; };
+    const std::string model_path, opt_path;
     std::mutex mu;
     std::thread last;
     Buf pending;
     bool has_pending = false;
 
+    AsyncSaver()
+        : model_path("../model/gpt_model.bin"), opt_path("../model/gpt_opt.bin") {}
+    AsyncSaver(std::string mp, std::string op)
+        : model_path(std::move(mp)), opt_path(std::move(op)) {}
+
     void queue_model(const std::vector<Tensor*>& params, i32 dim, i32 blocks, i32 ctx) {
         std::lock_guard<std::mutex> lk(mu);
-        pending.model.clear();
+        pending = Buf(); // fresh cycle: call queue_model() before queue_opt()
         for (auto* p : params) {
             Tensor cp(p->rows, p->cols, p->data); // deep copy
             pending.model.push_back(std::move(cp));
@@ -269,43 +312,50 @@ struct AsyncSaver {
         pending.t = t;
     }
 
-    // flush any still-running background writer before queueing the next one
     void join_prev() {
         std::lock_guard<std::mutex> lk(mu);
         if (last.joinable()) last.join();
     }
 
-    // spawn writer for the current pending snapshot (swallows it) on a background thread
+    // Spawn a writer for the current pending snapshot (swallows it). A still
+    // running previous writer is joined here: assigning to a joinable
+    // std::thread would terminate the process.
     void spawn() {
         std::lock_guard<std::mutex> lk(mu);
-        if (has_pending) {
-            Buf snap = std::move(pending);
-            has_pending = false;
-            std::string mp = "../model/gpt_model.bin", op = "../model/gpt_opt.bin";
-            last = std::thread([mp, op, snap = std::move(snap)]() mutable {
-                std::vector<Tensor*> ckpt;
-                for (auto& t : snap.model) ckpt.push_back(&t);
-                bool clean = true;
-                for (auto* p : ckpt) if (has_naninf_tensor(*p)) { clean = false; break; }
-                for (auto& t : snap.m) if (has_naninf_tensor(t)) { clean = false; break; }
-                for (auto& t : snap.v) if (has_naninf_tensor(t)) { clean = false; break; }
-                if (!clean) {
-                    fprintf(stderr, "  WARNING: checkpoint contains NaN/Inf — skipping disk write (keeping last good state)\n");
+        if (!has_pending) return;
+        if (last.joinable()) last.join();
+        Buf snap = std::move(pending);
+        has_pending = false;
+        const std::string mp = model_path, op = opt_path;
+        last = std::thread([mp, op, snap = std::move(snap)]() mutable {
+            std::vector<Tensor*> ckpt;
+            for (auto& t : snap.model) ckpt.push_back(&t);
+            bool clean = true;
+            for (auto* p : ckpt) if (has_naninf_tensor(*p)) { clean = false; break; }
+            for (auto& t : snap.m) if (has_naninf_tensor(t)) { clean = false; break; }
+            for (auto& t : snap.v) if (has_naninf_tensor(t)) { clean = false; break; }
+            if (!clean) {
+                fprintf(stderr, "  WARNING: checkpoint contains NaN/Inf — skipping disk write (keeping last good state)\n");
+                fflush(stderr);
+                return;
+            }
+            if (!Serialize::save_model(mp, ckpt, snap.dim, snap.blocks, snap.ctx)) {
+                fprintf(stderr, "  WARNING: failed to save model checkpoint to %s\n", mp.c_str());
+                fflush(stderr);
+                return; // do not publish a newer optimizer against an older model
+            }
+            if (!snap.m.empty()) {
+                std::vector<Tensor*> om, ov;
+                for (auto& t : snap.m) om.push_back(&t);
+                for (auto& t : snap.v) ov.push_back(&t);
+                if (!Serialize::save_optimizer(op, om, ov, snap.t)) {
+                    fprintf(stderr, "  WARNING: failed to save optimizer state to %s\n", op.c_str());
                     fflush(stderr);
-                    return;
                 }
-                Serialize::save_model(mp, ckpt, snap.dim, snap.blocks, snap.ctx);
-                if (!snap.m.empty()) {
-                    std::vector<Tensor*> om, ov;
-                    for (auto& t : snap.m) om.push_back(&t);
-                    for (auto& t : snap.v) ov.push_back(&t);
-                    Serialize::save_optimizer(op, om, ov, snap.t);
-                }
-            });
-        }
+            }
+        });
     }
 
-    // wait for any in-flight background writer to finish (call before exiting)
     void flush() {
         std::lock_guard<std::mutex> lk(mu);
         if (last.joinable()) last.join();

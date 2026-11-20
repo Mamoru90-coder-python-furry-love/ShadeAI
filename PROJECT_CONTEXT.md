@@ -231,13 +231,22 @@ Embedding використовує послідовність із **повто�
 
 **Guard-и розмірів у `CrossEntropyLoss::forward` (додано).** Раніше порожній batch ділив на нуль, а target з іншою формою читав поза своїм сховищем за адресою `i*C + j`. Додано `n > 0`, `C > 0` і `target.rows/cols == logits.rows/cols` через `std::invalid_argument`. `CEVal` відхиляє 5 випадків: порожні рядки, нуль класів, розсинхрон рядків/стовпців target і порожній target. Самі guard-и математику не змінюють.
 
-Наступні кандидати — лише P3-нотатки (можливий MaxPool tie-gap guard за іншого seed/config і порівняння `(f32)vocab_size` через `double`), якщо з'явиться підтвердження на даних.
+P3-нотатки (MaxPool tie-gap, `(f32)vocab_size`, soft labels) зафіксовано без змін і без коміту: підтверджень на даних немає, а ризик `vocab_size` дає хибне відхилення граничного ID, не OOB.
+
+#### Атомарний запис чекпойнтів і AsyncSaver — P3
+
+`Serialize::save`, `save_model`, `save_optimizer` писали напряму в ціль (`fopen(path, "wb")` одразу обрізає старий файл): переривання лишало урізаний checkpoint. Додано `Serialize::detail::write_atomic()` — запис у сусідній `path + ".tmp"`, `fflush`, `fclose`, потім одна атомарна заміна (`MoveFileExA(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` / `rename`). Помилка видаляє temp і не чіпає ціль. `save_gpt()` тепер використовує той самий `atomic_replace` замість локальної копії — формат v2 (SHDG + версія + CRC) не змінено.
+
+`AsyncSaver` отримав конфігуровані шляхи (default як раніше), скидання optimizer-стану в `queue_model()`, `join` попереднього потоку в `spawn()` (інакше присвоєння joinable `std::thread` → `std::terminate`), перевірку результатів `save_model`/`save_optimizer` із попередженням на stderr. Якщо модель не записалась, optimizer не публікується окремо. Документовано, що цей шлях пише legacy SHDE, а не v2 SHDG checkpoint.
+
+Тести в `tests/serialize_checks.cpp`: успішний запис не лишає `.tmp`; застарілий `.tmp` від перерваного запису не впливає на good-файл; заблокований `.tmp` → помилка, старі байти й старий model завантажуються; NaN-тензори відхиляються до запису; те саме для optimizer; AsyncSaver — round-trip, подвійний `spawn()` без `flush()`, NaN-снапшот лишає last good, failed model save не публікує optimizer.
+
+Негативні контролі (фактично запускались): повернення прямого запису → 5 `FAIL`, `atomic_checks: FAILED`, `exit=1`; прибраний `join` у `spawn()` → процес аварійно завершується `0xC0000409` (`std::terminate`).
 
 ### Ще не зроблено
 
-- Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
-- Інші шляхи запису (`Serialize::save_model`, `AsyncSaver`) ще не атомарні; GPT checkpoint — уже так.
+- Формати SHDE (AsyncSaver) і SHDG v2 (GPT) лишаються окремими; уніфікація не потрібна, поки обидва loader-и працюють.
 
 ---
 
