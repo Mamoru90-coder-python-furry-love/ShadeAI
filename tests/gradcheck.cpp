@@ -406,19 +406,23 @@ static void cross_entropy_ref(const Tensor& logits, const Tensor& target,
             e[j] = std::exp((double)logits.at(i, j) - mx);
             sum += e[j];
         }
+        // Independent log-sum-exp in double: deliberately no 1e-7 clamp, so a
+        // loss/gradient mismatch in production cannot hide behind the same
+        // clamp in the reference.
+        const double log_sum = std::log(sum);
         for (i32 j = 0; j < C; j++) {
             f32 t = target.at(i, j);
             f32 p = (f32)(e[j] / sum);
             grad.at(i, j) = (p - t) / (f32)n;
             if (t != 0.0f)
-                total += -(double)t * std::log((double)std::max(p, 1e-7f));
+                total -= (double)t * ((double)logits.at(i, j) - mx - log_sum);
         }
     }
     loss = (f32)(total / n);
 }
 
 static bool cross_entropy_case(const char* label, i32 n, i32 C,
-                               f32 base, f32 spread, bool do_fd) {
+                               f32 base, f32 spread, f32 eps) {
     Tensor logits(n, C), target(n, C, 0.0f);
     for (i32 i = 0; i < n; i++) {
         for (i32 j = 0; j < C; j++)
@@ -441,45 +445,47 @@ static bool cross_entropy_case(const char* label, i32 n, i32 C,
     }
 
     f32 worst_fd = 0;
-    if (do_fd) {
+    if (eps > 0.0f) {
         for (i32 k = 0; k < logits.size(); k++) {
             f32 orig = logits.data[k];
-            logits.data[k] = orig + GRAD_EPS;
+            logits.data[k] = orig + eps;
             f32 lp = CrossEntropyLoss::forward(logits, target, scratch);
-            logits.data[k] = orig - GRAD_EPS;
+            logits.data[k] = orig - eps;
             f32 lm = CrossEntropyLoss::forward(logits, target, scratch);
             logits.data[k] = orig;
-            f32 num = (lp - lm) / (2.0f * GRAD_EPS);
+            f32 num = (lp - lm) / (2.0f * eps);
             if (!std::isfinite(num)) { finite_ok = false; continue; }
             worst_fd = std::max(worst_fd, ce_relerr(num, dlogits.data[k]));
         }
     }
 
-    bool ok = finite_ok && worst_ref <= 1e-4f && (!do_fd || worst_fd <= 2e-3f);
+    bool ok = finite_ok && worst_ref <= 1e-4f && (eps <= 0.0f || worst_fd <= 2e-3f);
     std::printf("%-16s %s  ref %.3e  fd %.3e%s\n", label, ok ? "OK" : "FAIL",
-                worst_ref, worst_fd, do_fd ? "" : " (ref only)");
+                worst_ref, worst_fd, eps > 0.0f ? "" : " (ref only)");
     return ok;
 }
 
 static bool cross_entropy_loss_gradcheck() {
-    struct Case { const char* label; i32 n, C; f32 base, spread; bool fd; };
+    struct Case { const char* label; i32 n, C; f32 base, spread, eps; };
     // C = 8/16 hit the AVX path (one/two full blocks); C = 5/7 are scalar-only;
     // C = 9 mixes a full block with a tail. n varies to exercise 1/n.
     static const Case cases[] = {
-        {"CE n1 C8",     1,  8,    0.f,   5.f, true},
-        {"CE n3 C5",     3,  5,    0.f,   5.f, true},
-        {"CE n4 C9",     4,  9,    0.f,   5.f, true},
-        {"CE n8 C16",    8, 16,    0.f,   5.f, true},
-        {"CE n2 C7",     2,  7,    0.f,   5.f, true},
-        // Large absolute logits need max-subtraction; a 200-wide spread needs
-        // the exp(-80) AVX clamp / underflow. FD is skipped here: subtracting
-        // two f32 losses of magnitude ~2000 would measure cancellation.
-        {"CE bigbase",   3,  8, 1000.f,   2.f, false},
-        {"CE wide",      3, 16,    0.f, 100.f, false},
+        {"CE n1 C8",     1,  8,    0.f,   5.f, GRAD_EPS},
+        {"CE n3 C5",     3,  5,    0.f,   5.f, GRAD_EPS},
+        {"CE n4 C9",     4,  9,    0.f,   5.f, GRAD_EPS},
+        {"CE n8 C16",    8, 16,    0.f,   5.f, GRAD_EPS},
+        {"CE n2 C7",     2,  7,    0.f,   5.f, GRAD_EPS},
+        // Large absolute logits and a 200-wide spread (target probability far
+        // below the old 1e-7 clamp). FD uses a wider step there: with eps=1e-3
+        // the difference of two f32 losses of magnitude ~60 would mostly be
+        // rounding noise, not the derivative. The wider step keeps the central
+        // difference well above that noise while truncation stays < 2e-3.
+        {"CE bigbase",   3,  8, 1000.f,   2.f, 0.05f},
+        {"CE wide",      3, 16,    0.f, 100.f, 0.05f},
     };
     bool ok = true;
     for (const auto& c : cases)
-        ok &= cross_entropy_case(c.label, c.n, c.C, c.base, c.spread, c.fd);
+        ok &= cross_entropy_case(c.label, c.n, c.C, c.base, c.spread, c.eps);
     return ok;
 }
 

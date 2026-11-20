@@ -105,11 +105,11 @@ CharRNNVal       OK
 TransformerLMVal OK
 CE n1 C8         OK  ref 7.29e-08  fd 1.44e-04
 CE n3 C5         OK  ref 6.35e-08  fd 9.05e-05
-CE n4 C9         OK  ref 6.23e-08  fd 1.15e-04
+CE n4 C9         OK  ref 1.49e-08  fd 1.15e-04
 CE n8 C16        OK  ref 9.50e-08  fd 1.91e-04
 CE n2 C7         OK  ref 6.11e-08  fd 6.78e-05
-CE bigbase       OK  ref 2.98e-08 (ref only)
-CE wide          OK  ref 9.78e-09 (ref only)
+CE bigbase       OK  ref 7.66e-08  fd 8.34e-05 (eps=0.05)
+CE wide          OK  ref 9.78e-09  fd 4.08e-05 (eps=0.05)
 CEVal            OK
 ```
 
@@ -118,6 +118,7 @@ CEVal            OK
 - AdamW: `km = lr*ib1`, `kw = lr*wd`; decay без bias correction.
 - Positional encoding: частота залежить від пари координат `(j & ~1) / dim`.
 - Cross-entropy: `dlogits` ділиться на batch; у `gpt.cpp` — ще на `T`.
+- `CrossEntropyLoss::forward`: loss через log-sum-exp замість `log(max(p, 1e-7f))` — похідна знову відповідає `(p − onehot)/n`, коли p правильного класу << 1e-7.
 - Градієнти в `gpt.cpp` усереднюються перед `clip_grads`/`step`.
 - GRU: `gUn` використовує `r_j`, а не `r_k`.
 - Attention backward: `dA = dO @ Vᵀ`, `dV = Aᵀ @ dO`.
@@ -222,11 +223,13 @@ Embedding використовує послідовність із **повто�
 
 `CrossEntropyLoss` — спільний loss для `main.cpp`, MNIST MLP/CNN; до цього перевірявся лише побічно (simd_check порівнює AVX із scalar-еталоном для `n=3, C=19`). Новий харнес у `tests/gradcheck.cpp` перевіряє його напряму:
 
-- **finite differences** з `eps=1e-3` для `(n,C)` = `(1,8)`, `(3,5)`, `(4,9)`, `(8,16)`, `(2,7)` — тобто `C` кратне 8 (AVX: один/два блоки), `C < 8` (scalar-only) і `C = 9` (AVX-блок + scalar-хвіст); batch 1..8 перевіряє ділення на `n`. Найгірша FD-похибка **1.91e-04** (поріг `2e-3`).
-- **незалежний double-еталон** на тих самих f32-входах для всіх кейсів; найгірша похибка **9.50e-08** (поріг `1e-4`). Еталон особливо потрібний для `base=1000` (перевірка віднімання максимуму) і `spread=100` (exp-clamp/underflow): там скінченна різниця f32-loss вимірювала б переважно помилку округлення при відніманні двох великих значень, а не градієнт, тому FD для них пропущено.
+- **finite differences для всіх 7 кейсів**: `(n,C)` = `(1,8)`, `(3,5)`, `(4,9)`, `(8,16)`, `(2,7)` з `eps=1e-3` (AVX: один/два блоки; scalar-only; AVX + scalar-хвіст; batch 1..8 перевіряє `1/n`), а також `base=1000` і `spread=100` з `eps=0.05` — там loss ~60, тож `eps=1e-3` вимірював би переважно округлення f32. Найгірша FD-похибка **1.91e-04** (`CE n8 C16`, поріг `2e-3`); `CE wide` — **4.08e-05**.
+- **незалежний double-еталон** на тих самих f32-входах для всіх кейсів: log-sum-exp у double без жодного clamp; найгірша похибка **9.50e-08** (поріг `1e-4`). Раніше еталон повторював `max(p, 1e-7f)` і тому підтверджував хибну реалізацію, а не перевіряв loss ↔ gradient.
 - **one-hot targets** рядкової форми `n×C`, як і в усіх реальних викликах.
 
-**Guard-и розмірів у `CrossEntropyLoss::forward` (додано).** Раніше порожній batch ділив на нуль, а target з іншою формою читав поза своїм сховищем за адресою `i*C + j`. Додано `n > 0`, `C > 0` і `target.rows/cols == logits.rows/cols` через `std::invalid_argument`. `CEVal` відхиляє 5 випадків: порожні рядки, нуль класів, розсинхрон рядків/стовпців target і порожній target. Математика loss/градієнта не змінена.
+**Математика loss ↔ gradient (виправлено після аудиту `710f44c`).** Старий `log(max(p, 1e-7f))` робив loss пласким для p < 1e-7, тоді як `dlogits` лишався `(p − onehot)/n` — похідна більше не відповідала повернутому скаляру. У `CE wide` цільовий logit на 48–64 нижче максимуму, тобто p << 1e-7. Loss переписано як `log(sum(exp(z−m))) − (z_t−m)` (для загального target: `-Σ t_j (z_j − m − logsum)`); це стабільно навіть при underflow `exp`. Негативний контроль: зі старою формулою `CE wide FAIL ref 7.13e-01 fd 3.33e-01`, gradcheck `exit=1`; з виправленою — `OK ref 9.78e-09 fd 4.08e-05`.
+
+**Guard-и розмірів у `CrossEntropyLoss::forward` (додано).** Раніше порожній batch ділив на нуль, а target з іншою формою читав поза своїм сховищем за адресою `i*C + j`. Додано `n > 0`, `C > 0` і `target.rows/cols == logits.rows/cols` через `std::invalid_argument`. `CEVal` відхиляє 5 випадків: порожні рядки, нуль класів, розсинхрон рядків/стовпців target і порожній target. Самі guard-и математику не змінюють.
 
 Наступні кандидати — лише P3-нотатки (можливий MaxPool tie-gap guard за іншого seed/config і порівняння `(f32)vocab_size` через `double`), якщо з'явиться підтвердження на даних.
 

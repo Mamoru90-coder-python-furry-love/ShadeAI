@@ -53,12 +53,16 @@ struct CrossEntropyLoss {
 #endif
             for (; j < C; j++) dp[j] = dp[j] * inv - tp[j] / n;
 
-            // one-hot in practice: skip 12000 logs per row that multiply by zero
+            // log-softmax via log-sum-exp: log p_j = (z_j - max) - log(sum).
+            // The old log(max(p, 1e-7f)) made the loss flat once p fell below
+            // the clamp while dlogits below stayed (p - t)/n, so the returned
+            // scalar and its gradient disagreed for very unlikely targets.
+            // This form is stable even when exp(z_t - max) underflows.
+            const f32 log_sum = std::log(sum);
             for (j = 0; j < C; j++) {
-                if (tp[j] != 0.0f) {
-                    f32 p = std::exp(lp[j] - maxv) / sum;
-                    loss -= tp[j] * std::log(std::max(p, 1e-7f));
-                }
+                f32 t = tp[j];
+                if (t != 0.0f)
+                    loss -= t * (lp[j] - maxv - log_sum);
             }
         }
         return loss / n;
