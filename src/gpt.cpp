@@ -191,6 +191,8 @@ static constexpr i32 GPT_VERSION = 1;
 static constexpr int64_t GPT_MAX_MODEL_ELEMS = 50000000;
 // Checkpoint load keeps the staged `weights` vector alive while infer_gpt()
 // constructs the model (params extra floats), then moves buffers in.
+// All GPT_MAX_* limits are counts of float ELEMENTS (4 bytes each on x64),
+// not bytes: 50M elements = 200 MB of model, 75M = 300 MB including staging.
 static constexpr int64_t GPT_MAX_LOAD_ELEMS = 75000000;
 // Peak live activation tensors across forward+backward of every block.
 static constexpr int64_t GPT_MAX_ACTIVATION_ELEMS = 20000000;
@@ -232,22 +234,31 @@ static std::vector<ExpectedTensor> gpt_expected_shapes(const GPTConfig& c) {
 //   Act (GELU)    : last_in (T*4d)                            -> 4 Td
 //   Block fields  : last_x/-attn_out/-x1/-y/-ffn_out/-x2      -> 6 Td
 //   ------------------------------------------------------------------------
-//   persistent subtotal = 28 Td + 6 T^2 + 4 T
+//   persistent subtotal P = 28 Td + 6 T^2 + 4 T
 //
-// FORWARD transient peak, on top of that persistent set:
-//   ff1.forward = x.matmul(w).add(b): matmul result (4Td) + add result (4Td)
-//   + copy into last_output (4Td) = 12 Td;  attention head buffer sm = T^2.
-// BACKWARD transient peak, on top of that persistent set:
-//   12 named locals in TransformerBlock::backward = 18 Td
-//     (dx2, dy_skip, dffn, dffn2=4Td, dffn1_act=4Td, dy_ffn, dy_total,
-//      dx1, dx_skip, dattn, d_from_attn, dx_total),
-//   + SelfAttention::backward dO/dQ/dK/dV/dx = 5 Td,
-//   + per-head dA + dScores = 2 T^2.
+// FORWARD transients (moment -> extra live buffers, non-overlapping maxima):
+//   attention head : sm (T^2) + Kc/Vt (0.5Td) + head_out temp (0.25Td)
+//                    => T^2 + Td
+//   ff1 matmul/add : r1 (4Td) + r2 (4Td); copy into last_output reuses its
+//                    persistent buffer => 8 Td
+//   FFN locals     : ff1_out (4Td) + ff1_act (4Td) + ff2 r1/r2 (2Td) => 10 Td
+//   F = max(T^2 + Td, 10 Td)
 //
-//   per-block peak = persistent + max(fwd 12Td+T^2, bwd 23Td+2T^2)
-//                  = 51 Td + 8 T^2 + 4 T
+// BACKWARD transients:
+//   18 Td of named locals live until TransformerBlock::backward returns, but
+//   at the nested attn.backward peak only 16 Td of them exist yet, plus
+//   dO/dQ/dK/dV/dx (5 Td) and per-head dA/dScores (2 T^2):
+//   W = 21 Td + 2 T^2
 //
-// GPT level (outside blocks): output Dense keeps last_input (Td) +
+// GLOBAL peak -- the crucial correction: transients of different blocks NEVER
+// overlap (each block call returns before the next begins), while persistent
+// caches of ALL blocks stay live. Therefore:
+//
+//   total = B*P + max(F, W) + G
+//
+// NOT B*(P+max(F,W)) + G, which needlessly multiplied the transient by B.
+//
+// GPT level G (outside blocks): output Dense keeps last_input (Td) +
 //   last_output (Tv); forward adds h (Td) + pe (Td) + logits (Tv) and
 //   output.forward matmul/add (3Tv); training keeps logits+dlogits (2Tv)
 //   + output.backward d (Tv) + dh (Td). Conservative: 4 Tv + 3 Td.
@@ -279,37 +290,43 @@ static bool block_persistent_act(int64_t t, int64_t d, int64_t& out) {
     return true;
 }
 static bool block_forward_transient(int64_t t, int64_t d, int64_t& out) {
-    // 12 Td (ff1 matmul+add+last_output copy) + 1 T^2 (head softmax sm).
-    int64_t t2, td, a, b;
+    // max(attention head loop T^2+Td, FFN locals/matmul 10 Td).
+    // These windows do not overlap, so take the larger, never the sum.
+    int64_t t2, td, attn, ffn;
     if (!ck_mul(t, t, t2) || !ck_mul(t, d, td)) return false;
-    if (!ck_mul(12, td, a) || !ck_add(a, t2, b)) return false;
-    out = b; return true;
+    if (!ck_add(t2, td, attn) || !ck_mul(10, td, ffn)) return false;
+    out = ffn > attn ? ffn : attn;
+    return true;
 }
 static bool block_backward_transient(int64_t t, int64_t d, int64_t& out) {
-    // 23 Td (18 Td block locals + 5 Td attention internals) + 2 T^2 (dA, dScores).
+    // Nested attn.backward peak: 16 Td outer locals + 5 Td attention internals
+    // + 2 T^2 (dA, dScores). Later locals (d_from_attn, dx_total) do not exist
+    // yet at this point, so 18 Td is not the right multiplier here.
     int64_t t2, td, a, b;
     if (!ck_mul(t, t, t2) || !ck_mul(t, d, td)) return false;
-    if (!ck_mul(23, td, a) || !ck_mul(2, t2, b)) return false;
+    if (!ck_mul(21, td, a) || !ck_mul(2, t2, b)) return false;
     if (!ck_add(a, b, out)) return false;
     return true;
 }
 
 static bool gpt_activation_estimate(const GPTConfig& c, int64_t& out) {
     const int64_t t = c.max_len, d = c.dim, b = c.blocks, v = c.vocab;
-    int64_t persistent, fwd, bwd, transient, per_block, blocks_all;
+    int64_t persistent, fwd, bwd, transient, blocks_all, with_transient;
     int64_t tv, td, m4v, m3d, gpt_lvl;
     if (!block_persistent_act(t, d, persistent)) return false;
     if (!block_forward_transient(t, d, fwd)) return false;
     if (!block_backward_transient(t, d, bwd)) return false;
-    // Forward and backward transients never overlap: take the larger.
+    // GLOBAL lifetime: every block's persistent caches stay live, but only
+    // ONE block's transient peak exists at a time (forward/backward are
+    // separate phases and each block call returns before the next begins).
     transient = bwd > fwd ? bwd : fwd;
-    if (!ck_add(persistent, transient, per_block)) return false;
-    if (!ck_mul(b, per_block, blocks_all)) return false;
+    if (!ck_mul(b, persistent, blocks_all)) return false;
+    if (!ck_add(blocks_all, transient, with_transient)) return false;
     // GPT-level: 4 Tv + 3 Td (output Dense caches + logits/dlogits/pe/h).
     if (!ck_mul(t, v, tv) || !ck_mul(t, d, td)) return false;
     if (!ck_mul(4, tv, m4v) || !ck_mul(3, td, m3d)) return false;
     if (!ck_add(m4v, m3d, gpt_lvl)) return false;
-    if (!ck_add(blocks_all, gpt_lvl, out)) return false;
+    if (!ck_add(with_transient, gpt_lvl, out)) return false;
     return true;
 }
 

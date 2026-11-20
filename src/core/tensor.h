@@ -20,6 +20,41 @@
 using f32 = float;
 using i32 = int32_t;
 
+// Optional instrumentation for the memory-ledger regression test. Defined
+// only when the test build passes /DSHADE_MEM_TRACK; production builds have
+// no extra state and no extra work. Tensor allocation happens on the calling
+// thread (all allocations precede the OpenMP parallel regions), so a plain
+// counter is sufficient.
+#ifdef SHADE_MEM_TRACK
+#include <atomic>
+namespace shade_mem {
+inline int64_t& live() { static int64_t v = 0; return v; }
+inline int64_t& peak() { static int64_t v = 0; return v; }
+inline void add(int64_t n) { live() += n; if (live() > peak()) peak() = live(); }
+inline void sub(int64_t n) { live() -= n; }
+inline void reset_peak() { peak() = live(); }
+struct Tracker {
+    int64_t n;
+    Tracker() : n(0) {}
+    explicit Tracker(int64_t n_) : n(n_) { add(n_); }
+    Tracker(const Tracker& o) : n(o.n) { add(n); }
+    Tracker(Tracker&& o) noexcept : n(o.n) { o.n = 0; } // ownership transfer
+    Tracker& operator=(const Tracker& o) {
+        if (this != &o) { sub(n); n = o.n; add(n); }
+        return *this;
+    }
+    Tracker& operator=(Tracker&& o) noexcept {
+        if (this != &o) { sub(n); n = o.n; o.n = 0; }
+        return *this;
+    }
+    ~Tracker() { sub(n); }
+};
+} // namespace shade_mem
+#define SHADE_TRACKER , tr((int64_t)data.size())
+#else
+#define SHADE_TRACKER
+#endif
+
 // Checks stay active in Release (NDEBUG does not disable them).
 static inline i32 checked_size(i32 r, i32 c) {
     if (r < 0 || c < 0) throw std::invalid_argument("Tensor: negative dimension");
@@ -31,14 +66,17 @@ static inline i32 checked_size(i32 r, i32 c) {
 struct Tensor {
     i32 rows, cols;
     std::vector<f32> data;
+#ifdef SHADE_MEM_TRACK
+    shade_mem::Tracker tr;
+#endif
 
-    Tensor() : rows(0), cols(0) {}
-    Tensor(i32 r, i32 c, f32 v = 0.0f) : rows(r), cols(c), data(checked_size(r, c), v) {}
-    Tensor(i32 r, i32 c, const std::vector<f32>& d) : rows(r), cols(c), data(d) {
+    Tensor() : rows(0), cols(0) SHADE_TRACKER {}
+    Tensor(i32 r, i32 c, f32 v = 0.0f) : rows(r), cols(c), data(checked_size(r, c), v) SHADE_TRACKER {}
+    Tensor(i32 r, i32 c, const std::vector<f32>& d) : rows(r), cols(c), data(d) SHADE_TRACKER {
         if (d.size() != (size_t)checked_size(r, c))
             throw std::invalid_argument("Tensor: data size does not match rows * cols");
     }
-    Tensor(i32 r, i32 c, std::vector<f32>&& d) : rows(r), cols(c), data(std::move(d)) {
+    Tensor(i32 r, i32 c, std::vector<f32>&& d) : rows(r), cols(c), data(std::move(d)) SHADE_TRACKER {
         if (data.size() != (size_t)checked_size(r, c))
             throw std::invalid_argument("Tensor: data size does not match rows * cols");
     }

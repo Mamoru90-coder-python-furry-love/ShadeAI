@@ -75,35 +75,44 @@ int main() {
                     (long long)params, (long long)actual, shapes.size());
     }
 
-    // ---- activation ledger: coefficients derived from the live tensor fields ----
+    // ---- activation ledger: global lifetime peak, not per-block transients ----
     {
-        GPTConfig one = cfg; one.blocks = 1;
-        GPTConfig eight = cfg; eight.blocks = 8;
-        int64_t a1 = -1, a8 = -1;
-        expect(gpt_activation_estimate(one, a1) && gpt_activation_estimate(eight, a8),
-               "activation estimate computes");
         const int64_t t = cfg.max_len, d = cfg.dim;
-        const int64_t per_block = 51 * t * d + 8 * t * t + 4 * t;
-        expect(a8 - a1 == 7 * per_block, "activation estimate scales with blocks");
-        // Ledger cross-check: 28Td persistent + 23Td max transient + 8T^2 + 4T.
-        expect(per_block == 28 * t * d + 23 * t * d + 8 * t * t + 4 * t,
-               "per-block coefficient matches tensor ledger");
-        std::printf("  activations: 1 block=%lld, 8 blocks=%lld (per block=%lld)\n",
-                    (long long)a1, (long long)a8, (long long)per_block);
+        int64_t p = 0, f = 0, w = 0;
+        expect(block_persistent_act(t, d, p), "persistent peak computes");
+        expect(block_forward_transient(t, d, f), "forward peak computes");
+        expect(block_backward_transient(t, d, w), "backward peak computes");
+
+        GPTConfig one = cfg; one.blocks = 1;
+        GPTConfig two = cfg; two.blocks = 2;
+        GPTConfig eight = cfg; eight.blocks = 8;
+        GPTConfig hundred = cfg; hundred.blocks = 100;
+        int64_t a1 = -1, a2 = -1, a8 = -1, a100 = -1;
+        expect(gpt_activation_estimate(one, a1) && gpt_activation_estimate(two, a2) &&
+               gpt_activation_estimate(eight, a8) && gpt_activation_estimate(hundred, a100),
+               "activation estimate computes");
+        // Only PERSISTENT caches scale with blocks; the transient peak is global.
+        expect(a2 - a1 == p && a8 - a1 == 7 * p && a100 - a1 == 99 * p,
+               "only persistent activation scales with blocks");
+        expect(a1 == p + (w > f ? w : f) + 4 * t * cfg.vocab + 3 * t * d,
+               "one-block estimate equals P + max(F,W) + G");
+        std::printf("  activations: 1 block=%lld, 8 blocks=%lld (P=%lld F=%lld W=%lld)\n",
+                    (long long)a1, (long long)a8, (long long)p, (long long)f, (long long)w);
     }
     {
-        // Each phase peak is auditable on its own and sums to the estimate.
+        // Each phase peak is auditable on its own and combines globally.
         const int64_t t = cfg.max_len, d = cfg.dim;
         int64_t p = 0, f = 0, b = 0, total = 0;
         expect(block_persistent_act(t, d, p) && p == 28 * t * d + 6 * t * t + 4 * t,
                "persistent phase peak matches ledger");
-        expect(block_forward_transient(t, d, f) && f == 12 * t * d + t * t,
-               "forward phase peak matches ledger");
-        expect(block_backward_transient(t, d, b) && b == 23 * t * d + 2 * t * t,
-               "backward phase peak matches ledger");
+        const int64_t fwd_expected = (10 * t * d > t * t + t * d) ? 10 * t * d : t * t + t * d;
+        expect(block_forward_transient(t, d, f) && f == fwd_expected,
+               "forward phase peak is max(T^2+Td, 10Td), not a sum");
+        expect(block_backward_transient(t, d, b) && b == 21 * t * d + 2 * t * t,
+               "backward phase peak matches nested-call ledger");
         expect(gpt_activation_estimate(cfg, total) &&
-               total == cfg.blocks * (p + (b > f ? b : f)) + 4 * t * cfg.vocab + 3 * t * d,
-               "activation estimate equals summed phase peaks");
+               total == cfg.blocks * p + (b > f ? b : f) + 4 * t * cfg.vocab + 3 * t * d,
+               "activation estimate equals B*P + max(F,W) + G");
     }
     {
         // Many blocks x long ctx: the old flat 2*T^2 estimate accepted this.
