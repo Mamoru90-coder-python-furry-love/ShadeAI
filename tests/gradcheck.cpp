@@ -48,8 +48,9 @@ static f32 mse(const Tensor& pred, const Tensor& target, Tensor* dout) {
 }
 
 template <typename Forward, typename Backward>
-// expect_fail is used by the NaN sentinel self-test below: it inverts the
-// result and suppresses output when a deliberately broken backward is fed in.
+// expect_fail is used by the NaN sentinel self-test below: it requires that
+// the harness failed *specifically* because it saw a non-finite value, so a
+// failure for any other reason cannot make the sentinel look successful.
 static bool gradcheck(const std::string& name,
                       Forward forward, Backward backward,
                       const std::vector<Tensor*>& params,
@@ -82,8 +83,10 @@ static bool gradcheck(const std::string& name,
     f32 worst = 0;
     std::string worst_at;
     // NaN > worst is false, so without this flag a non-finite gradient could
-    // silently leave worst at 0 and report a false OK.
+    // silently leave worst at 0 and report a false OK. nonfinite_seen lets the
+    // sentinel self-test prove the *reason* for a rejection.
     bool finite_ok = true;
+    bool nonfinite_seen = false;
 
     auto numeric = [&](Tensor& p, i32 idx) {
         f32 orig = p.data[idx];
@@ -108,6 +111,7 @@ static bool gradcheck(const std::string& name,
                         std::fprintf(stderr, "%s: %s[%zu].data[%d] non-finite gradient (numeric=%g, analytic=%g)\n",
                                      name.c_str(), kind.c_str(), k, i, (double)num, (double)a);
                     finite_ok = false;
+                    nonfinite_seen = true;
                     continue;
                 }
                 f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
@@ -116,6 +120,7 @@ static bool gradcheck(const std::string& name,
                         std::fprintf(stderr, "%s: %s[%zu].data[%d] non-finite error\n",
                                      name.c_str(), kind.c_str(), k, i);
                     finite_ok = false;
+                    nonfinite_seen = true;
                     continue;
                 }
                 if (err > group_worst) { group_worst = err; group_at = std::to_string(i); }
@@ -130,7 +135,8 @@ static bool gradcheck(const std::string& name,
     sweep(inputs, "input", analytic_input);
 
     bool ok = finite_ok && worst <= tol;
-    if (expect_fail) return !ok; // sentinel: rejection is the expected result
+    // Sentinel: reject only if a non-finite value was the actual cause.
+    if (expect_fail) return !ok && nonfinite_seen;
     std::printf("%-12s %s  worst rel err %.3e at %s\n",
                 name.c_str(), ok ? "OK" : "FAIL", worst, worst_at.c_str());
     return ok;
