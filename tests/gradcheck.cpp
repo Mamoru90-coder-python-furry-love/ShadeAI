@@ -5,6 +5,14 @@
 #include "../src/layers/layernorm.h"
 #include "../src/layers/gru.h"
 #include "../src/layers/attention.h"
+#include "../src/utils/embedding.h"
+#include "../src/layers/transformer.h"
+// Exercise the real GPT composition (embedding + positional encoding +
+// transformer blocks + output head), not a reimplementation. Rename its CLI
+// main so it does not clash with this test's main.
+#define main gpt_cli_main
+#include "../src/gpt.cpp"
+#undef main
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -106,6 +114,36 @@ static bool gradcheck(const std::string& name,
     return ok;
 }
 
+// The training loop uses GPT::compute_loss (cross-entropy), not the MSE the
+// generic harness uses to feed dout. Check that its dlogits really are the
+// finite-difference gradient of the scalar mean loss.
+static bool gpt_loss_gradcheck() {
+    GPT gpt(8, 4, 1, 8);
+    Tensor logits = random_tensor(5, 8);
+    Tensor targets(1, 5);
+    for (i32 i = 0; i < targets.cols; i++) targets.data[i] = (f32)(i % 8);
+    Tensor scratch(5, 8), dlogits(5, 8);
+    gpt.compute_loss(logits, targets, dlogits);
+
+    const f32 eps = 1e-3f;
+    f32 worst = 0;
+    for (i32 i = 0; i < logits.size(); i++) {
+        f32 orig = logits.data[i];
+        logits.data[i] = orig + eps;
+        f32 lp = gpt.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig - eps;
+        f32 lm = gpt.compute_loss(logits, targets, scratch);
+        logits.data[i] = orig;
+        f32 num = (lp - lm) / (2.0f * eps);
+        f32 a = dlogits.data[i];
+        f32 err = std::fabs(num - a) / std::fmax(1.0f, std::fmax(std::fabs(num), std::fabs(a)));
+        if (err > worst) worst = err;
+    }
+    bool ok = worst <= 2e-3f;
+    std::printf("%-12s %s  worst rel err %.3e\n", "GPTLoss", ok ? "OK" : "FAIL", worst);
+    return ok;
+}
+
 int main() {
     srand(2026);
     bool ok = true;
@@ -154,6 +192,48 @@ int main() {
             [&](const Tensor& dout, std::vector<Tensor>& ig) { ig.push_back(att.backward(dout)); },
             att.params(), att.grads(), {&x});
     }
+
+    {
+        // Discrete ids have no numeric gradient, so only the embedding table
+        // is checked. backward() accumulates into gw; the harness zeros it
+        // before the single analytic call and numeric forward() never writes
+        // grads. Every vocab row is present in the sequence so all weights
+        // receive a non-zero finite-difference signal.
+        Embedding emb(8, 4);
+        randomize(emb.w);
+        Tensor ids(1, 8);
+        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = (f32)(i % 8);
+        ok &= gradcheck("Embedding",
+            [&] { return emb.forward(ids); },
+            [&](const Tensor& dout, std::vector<Tensor>&) { emb.backward(dout, ids); },
+            {&emb.w}, {&emb.gw}, {});
+    }
+
+    {
+        TransformerBlock tb(8);   // embed_dim divisible by 4 -> FFN dim 32
+        for (auto* p : tb.params()) randomize(*p);
+        Tensor x = random_tensor(5, 8);
+        ok &= gradcheck("TransformerBlock",
+            [&] { return tb.forward(x); },
+            [&](const Tensor& dout, std::vector<Tensor>& ig) { ig.push_back(tb.backward(dout)); },
+            tb.params(), tb.grads(), {&x});
+    }
+
+    {
+        // Small real GPT: 8 vocab, dim 4 (4 heads, head_dim 1), TWO blocks so
+        // the reversed block loop in GPT::backward is actually exercised.
+        // Input ids are discrete, so only parameter gradients are compared.
+        GPT gpt(8, 4, 2, 8);
+        for (auto* p : gpt.params()) randomize(*p);
+        Tensor ids(1, 5);
+        for (i32 i = 0; i < ids.cols; i++) ids.data[i] = (f32)(i % 8);
+        ok &= gradcheck("GPT",
+            [&] { return gpt.forward(ids); },
+            [&](const Tensor& dout, std::vector<Tensor>&) { gpt.backward(dout, ids); },
+            gpt.params(), gpt.grads(), {});
+    }
+
+    ok &= gpt_loss_gradcheck();
 
     if (!ok) {
         std::fprintf(stderr, "gradcheck: FAILED\n");
