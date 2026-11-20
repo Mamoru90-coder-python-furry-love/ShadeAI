@@ -185,7 +185,10 @@ struct GPT {
 // Reuses the validated block I/O from Serialize::detail so a corrupt file is
 // rejected without ever touching a live model.
 // ---------------------------------------------------------------------------
-static constexpr i32 GPT_MAGIC = 0x53484447; // "SHDG"
+// Legacy wire signature, unchanged since v1. Serialized little-endian, the
+// four on-disk bytes are 'G','D','H','S' ("GDHS") -- NOT the literal "SHDG".
+// Do not "fix" this to ASCII SHDG without introducing a new format version.
+static constexpr i32 GPT_MAGIC = 0x53484447;
 // Fixed-width, little-endian (x86/x64) integer fields; floats are IEEE-754
 // binary32. v1 header: magic, version, vocab, dim, blocks, ctx (24 bytes).
 // v2 inserts a u32 CRC-32 at offset 8; config therefore starts at offset 12.
@@ -473,7 +476,8 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
 }
 
 bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
-                         Tokenizer& tok, std::vector<Tensor>& weights) {
+                         Tokenizer& tok, std::vector<Tensor>& weights,
+                         size_t max_tokenizer_bytes = Tokenizer::MAX_BYTES) {
     using namespace Serialize::detail;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -513,7 +517,7 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
         if (!gpt_config_budget(parsed, expected_params)) break;
         const auto expected = gpt_expected_shapes(parsed);
 
-        if (!parsed_tok.read(f) || parsed_tok.vocab_size != parsed.vocab) break;
+        if (!parsed_tok.read(f, max_tokenizer_bytes) || parsed_tok.vocab_size != parsed.vocab) break;
 
         i32 nt;
         if (!read_i32(f, nt) || nt != (i32)expected.size()) break;

@@ -298,9 +298,12 @@ int main() {
     expect(save_gpt(ck.string(), gpt, tok), "re-save over existing checkpoint");
     expect(read_gpt_checkpoint(ck.string(), cfg, tok2, weights), "reload after overwrite");
 
+    const auto before_failed_save = read_all(ck);
     const fs::path blocked = fs::path(ck.string() + ".tmp");
     fs::create_directory(blocked);
     expect(!save_gpt(ck.string(), gpt, tok), "save fails when temp path is blocked");
+    expect(read_all(ck) == before_failed_save,
+           "previous checkpoint bytes unchanged after failed save");
     expect(read_gpt_checkpoint(ck.string(), cfg, tok2, weights),
            "previous checkpoint survives a failed save");
     fs::remove(blocked);

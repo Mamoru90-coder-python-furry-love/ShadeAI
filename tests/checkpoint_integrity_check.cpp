@@ -85,6 +85,9 @@ int main() {
     auto bytes = read_all(good);
     expect(bytes.size() > 128, "v2 file is non-trivial");
     expect(get_i32(bytes, 0) == GPT_MAGIC, "v2 magic");
+    // Wire order is the legacy GDHS (0x53484447 stored little-endian).
+    expect(bytes[0] == 'G' && bytes[1] == 'D' && bytes[2] == 'H' && bytes[3] == 'S',
+           "legacy magic wire bytes are GDHS, not literal SHDG");
     expect(get_i32(bytes, 4) == GPT_VERSION_V2, "v2 version tag");
     {
         uint32_t stored = 0; std::memcpy(&stored, bytes.data() + 8, 4);
@@ -113,6 +116,43 @@ int main() {
         expect(same_state(snap, c, t, w), "no partial state after rejection");
     };
 
+    size_t tok_off = 28 + 4;                 // first word's length field (v2 header + count)
+    size_t tensor_off = tok_off;
+    for (const auto& w : tok.id2word) tensor_off += 4 + w.size();
+    tensor_off += 4;                         // tensor count
+
+    // ---- tokenizer metadata budget: valid CRC does not grant unlimited RAM ----
+    {
+        GPTConfig c = snap.cfg; Tokenizer t = snap.tok; std::vector<Tensor> w = snap.w;
+        expect(!read_gpt_checkpoint(good.string(), c, t, w, 64),
+               "tight tokenizer byte budget rejects an otherwise valid file");
+        expect(same_state(snap, c, t, w), "no partial state on tokenizer budget failure");
+
+        // Declared length exceeds the bytes actually left in the file: must be
+        // rejected before std::string(len) allocates.
+        auto b = bytes;
+        put_i32(b, tok_off, 1 << 20);
+        fix_crc(b);
+        reject(b, "oversized token length rejected before allocation");
+    }
+
+    // ---- duplicate tokens are rejected (checked by Tokenizer::read directly) ----
+    {
+        FILE* tf = tmpfile();
+        const i32 n = 6;
+        bool built = tf && fwrite(&n, sizeof(n), 1, tf) == 1;
+        const char* words[] = { "<PAD>", "<UNK>", "<BOS>", "<EOS>", "a", "a" };
+        for (int i = 0; built && i < n; i++) {
+            i32 len = (i32)std::strlen(words[i]);
+            built = fwrite(&len, sizeof(len), 1, tf) == 1 &&
+                    fwrite(words[i], 1, (size_t)len, tf) == (size_t)len;
+        }
+        Tokenizer dup;
+        if (built) built = fseek(tf, 0, SEEK_SET) == 0 && !dup.read(tf);
+        if (tf) fclose(tf);
+        expect(built, "duplicate token rejected");
+    }
+
     // ---- structural corruption ----
     reject({}, "zero-length file rejected");
     { auto b = bytes; b.resize(7); reject(b, "shorter than header rejected"); }
@@ -124,10 +164,6 @@ int main() {
     // ---- checksum detection ----
     { auto b = bytes; b[8] ^= 0x01; reject(b, "wrong checksum rejected"); }
     // One flipped byte anywhere in config / tokenizer / weights is caught.
-    size_t tok_off = 28 + 4;                 // v2 header + tokenizer word count
-    size_t tensor_off = tok_off;
-    for (const auto& w : tok.id2word) tensor_off += 4 + w.size();
-    tensor_off += 4;                         // tensor count
     {
         auto b = bytes; b[tensor_off + 8 + 13] ^= 0x20;
         reject(b, "flipped weight byte rejected by checksum");
@@ -155,7 +191,7 @@ int main() {
         reject(b, "combined config budget rejected despite valid checksum");
     }
     {
-        auto b = bytes; b[tok_off + 4 + 4] = 'X'; fix_crc(b); // first char of "<PAD>"
+        auto b = bytes; b[tok_off + 4] = 'X'; fix_crc(b); // first char of "<PAD>"
         reject(b, "corrupt special token rejected despite valid checksum");
     }
     {
@@ -220,6 +256,18 @@ int main() {
         expect(nw.size() == fw.size(), "v1 -> v2 tensor count preserved");
         for (size_t i = 0; i < nw.size() && i < fw.size(); i++)
             expect(nw[i].data == fw[i].data, "v1 -> v2 weights preserved");
+    }
+
+    // ---- final-replace failure: no half-written checkpoint left behind ----
+    {
+        const fs::path dest_dir = dir / "shade_integrity_dest_dir";
+        fs::remove_all(dest_dir);
+        fs::create_directory(dest_dir);
+        expect(!save_gpt(dest_dir.string(), gpt, tok),
+               "save fails when final replace target is a directory");
+        expect(!fs::exists(dest_dir.string() + ".tmp"),
+               "no temp file left after failed final replace");
+        fs::remove_all(dest_dir);
     }
 
     for (const auto& p : { good, good2, bad, v2fromv1 }) fs::remove(p);

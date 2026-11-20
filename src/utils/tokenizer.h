@@ -104,27 +104,70 @@ struct Tokenizer {
         return true;
     }
 
-    bool read(FILE* f) {
+    // Upper bounds for metadata read from an untrusted checkpoint. The byte
+    // budget covers BOTH containers: id2word (string object + data) and
+    // word2id (node + duplicated key string + bucket). It is charged before
+    // each allocation, so 1e6 words x 1 MiB cannot exhaust RAM.
+    static constexpr i32 MAX_WORDS = 1000000;
+    static constexpr i32 MAX_WORD_LEN = 1 << 20;
+    static constexpr size_t MAX_BYTES = 64u * 1024u * 1024u;
+    static constexpr size_t NODE_AND_BUCKET = 48; // unordered_map estimate
+    static constexpr size_t BASE_PER_WORD = 2 * sizeof(std::string) + NODE_AND_BUCKET;
+
+    // max_bytes can be tightened by the caller (e.g. a checkpoint reader with
+    // its own budget). Nothing is committed to *this until every check passes.
+    bool read(FILE* f, size_t max_bytes = MAX_BYTES) {
         if (!f) return false;
+
+        // Determine how many bytes actually remain so a declared length is
+        // never used to allocate before the file is known to contain it.
+        const long start = ftell(f);
+        if (start < 0 || fseek(f, 0, SEEK_END) != 0) return false;
+        const long end = ftell(f);
+        if (end < start || fseek(f, start, SEEK_SET) != 0) return false;
+        int64_t remaining = (int64_t)end - start;
+
         i32 n;
-        if (fread(&n, sizeof(i32), 1, f) != 1 || n < SPECIAL || n > 1000000) return false;
+        if (remaining < (int64_t)sizeof(i32) || fread(&n, sizeof(i32), 1, f) != 1) return false;
+        remaining -= sizeof(i32);
+        if (n < SPECIAL || n > MAX_WORDS) return false;
+        // Every word costs at least BASE_PER_WORD + 2 bytes (two NULs).
+        if ((size_t)n > max_bytes / (BASE_PER_WORD + 2)) return false;
+
         std::vector<std::string> words;
         words.reserve((size_t)n);
+        size_t used = 0;
         for (i32 i = 0; i < n; i++) {
+            if (remaining < (int64_t)sizeof(i32)) return false;
             i32 len;
-            if (fread(&len, sizeof(i32), 1, f) != 1 || len < 0 || len > (1 << 20)) return false;
+            if (fread(&len, sizeof(i32), 1, f) != 1) return false;
+            remaining -= sizeof(i32);
+            if (len < 0 || len > MAX_WORD_LEN) return false;
+            if ((int64_t)len > remaining) return false; // file must contain the payload
+            remaining -= len;
+
+            const size_t cost = BASE_PER_WORD + 2 * (size_t)(len + 1);
+            if (cost > max_bytes - used) return false; // no underflow: used <= max_bytes
+            used += cost;
+
             std::string w((size_t)len, '\0');
             if (len > 0 && fread(&w[0], 1, (size_t)len, f) != (size_t)len) return false;
             words.push_back(std::move(w));
         }
+
         // Generation indexes BOS/EOS/UNK directly, so their IDs must be intact.
         static const char* specials[SPECIAL] = { "<PAD>", "<UNK>", "<BOS>", "<EOS>" };
         for (i32 i = 0; i < SPECIAL; i++)
             if (words[(size_t)i] != specials[i]) return false;
 
+        std::unordered_map<std::string, int> map;
+        map.reserve((size_t)n);
+        for (i32 i = 0; i < n; i++)
+            if (!map.emplace(words[(size_t)i], i).second) return false; // duplicate token
+        if ((i32)map.size() != n) return false;
+
         id2word = std::move(words);
-        word2id.clear();
-        for (i32 i = 0; i < n; i++) word2id[id2word[(size_t)i]] = i;
+        word2id = std::move(map);
         vocab_size = n;
         return true;
     }
