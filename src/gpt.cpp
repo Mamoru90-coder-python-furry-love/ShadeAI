@@ -24,6 +24,7 @@
 #include <ctime>
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
 #include <memory>
 
 // Keep exactly top_k largest probabilities. Ties break by lower index, so a
@@ -185,11 +186,51 @@ struct GPT {
 // ---------------------------------------------------------------------------
 static constexpr i32 GPT_MAGIC = 0x53484447; // "SHDG"
 static constexpr i32 GPT_VERSION = 1;
-// 50M floats = 200 MB. Caps each tensor, the total weights, and one activation
-// buffer, so a hostile config cannot exhaust RAM before the model is built.
-static constexpr int64_t GPT_MAX_TENSOR_ELEMS = 50000000;
+// 50M floats = 200 MB. A hostile config must be rejected before any GPT object
+// is built. Weights, gradients and Dense transpose caches all count.
+static constexpr int64_t GPT_MAX_MODEL_ELEMS = 50000000;
+// Forward activations: T*dim buffers and the T*T attention score matrices.
+static constexpr int64_t GPT_MAX_ACTIVATION_ELEMS = 20000000;
 
 struct GPTConfig { i32 vocab, dim, blocks, max_len; };
+struct ExpectedTensor { i32 rows, cols; };
+
+// Derive the exact parameter layout of GPT::params() from the config alone.
+// Order: embed.w, output.w, output.b, then 12 tensors per TransformerBlock.
+static std::vector<ExpectedTensor> gpt_expected_shapes(const GPTConfig& c) {
+    std::vector<ExpectedTensor> s;
+    s.reserve((size_t)(3 + 12 * (int64_t)c.blocks));
+    s.push_back({ c.vocab, c.dim });   // embed.w
+    s.push_back({ c.dim, c.vocab });   // output.w
+    s.push_back({ 1, c.vocab });       // output.b
+    const i32 ffn = c.dim * 4;
+    for (i32 b = 0; b < c.blocks; b++) {
+        for (int k = 0; k < 4; k++) s.push_back({ c.dim, c.dim }); // Wq, Wk, Wv, Wo
+        s.push_back({ 1, c.dim });     s.push_back({ 1, c.dim });     // ln1.gamma/beta
+        s.push_back({ c.dim, ffn });   s.push_back({ 1, ffn });       // ff1.w/b
+        s.push_back({ ffn, c.dim });   s.push_back({ 1, c.dim });     // ff2.w/b
+        s.push_back({ 1, c.dim });     s.push_back({ 1, c.dim });     // ln2.gamma/beta
+    }
+    return s;
+}
+
+// Budget the whole model before any GPT object is constructed. Returns the
+// expected parameter count so the reader can enforce it per tensor.
+static bool gpt_config_budget(const GPTConfig& c, int64_t& out_params) {
+    if (c.dim % 4 != 0) return false; // SelfAttention heads=4 and FFN need this
+    if (c.dim > std::numeric_limits<i32>::max() / 4) return false;
+
+    const int64_t d = c.dim, v = c.vocab, b = c.blocks, t = c.max_len;
+    const int64_t params = 2 * v * d + v + b * (12 * d * d + 9 * d);
+    const int64_t caches = b * 8 * d * d + v * d; // ff1.wT + ff2.wT + output.wT
+    const int64_t model_elems = params * 2 + caches; // +1 for gradients
+    const int64_t act_elems = t * d * 8 + t * t * 2;
+    if (params <= 0 || model_elems <= 0 || act_elems <= 0) return false; // overflow
+    if (model_elems > GPT_MAX_MODEL_ELEMS) return false;
+    if (act_elems > GPT_MAX_ACTIVATION_ELEMS) return false;
+    out_params = params;
+    return true;
+}
 
 static bool atomic_replace(const std::string& tmp, const std::string& dst) {
 #ifdef _WIN32
@@ -250,24 +291,31 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
         if (cfg.dim < 1 || cfg.dim > 65536) break;
         if (cfg.blocks < 1 || cfg.blocks > 1024) break;
         if (cfg.max_len < 1 || cfg.max_len > 1000000) break;
-        // Individually legal values can still combine into a huge allocation.
-        if ((int64_t)cfg.max_len * cfg.dim > GPT_MAX_TENSOR_ELEMS) break;
+
+        // Reject the whole architecture before infer_gpt() constructs it:
+        // params + gradients + caches + activations, not just file size.
+        int64_t expected_params = 0;
+        if (!gpt_config_budget(cfg, expected_params)) break;
+        const auto expected = gpt_expected_shapes(cfg);
 
         if (!tok.read(f) || tok.vocab_size != cfg.vocab) break;
 
         i32 nt;
-        if (!read_i32(f, nt) || nt < 1 || nt > 10000) break;
+        if (!read_i32(f, nt) || nt != (i32)expected.size()) break;
         weights.clear();
-        weights.reserve((size_t)nt);
+        weights.reserve(expected.size());
         int64_t total_elems = 0;
-        for (i32 i = 0; i < nt; i++) {
+        for (size_t i = 0; i < expected.size(); i++) {
             Tensor t;
-            if (!read_tensor(f, t, -1, -1, (size_t)GPT_MAX_TENSOR_ELEMS)) break;
+            // Shape and the *remaining* parameter budget are both checked
+            // inside read_tensor(), before it allocates the data buffer.
+            const size_t remaining = (size_t)(expected_params - total_elems);
+            if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining)) break;
             total_elems += (int64_t)t.rows * t.cols;
-            if (total_elems > GPT_MAX_TENSOR_ELEMS) break;
             weights.push_back(std::move(t));
         }
-        if ((i32)weights.size() != nt || !at_eof(f)) break;
+        if (weights.size() != expected.size() || total_elems != expected_params
+            || !at_eof(f)) break;
         ok = true;
     } while (false);
     fclose(f);

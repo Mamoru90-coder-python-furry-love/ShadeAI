@@ -58,6 +58,23 @@ int main() {
            "config round-trip");
     expect(tok2.id2word == tok.id2word, "tokenizer round-trip");
 
+    // The shapes derived from config must exactly match GPT::params().
+    {
+        auto shapes = gpt_expected_shapes(cfg);
+        auto live = gpt.params();
+        expect(shapes.size() == live.size(), "expected tensor count matches GPT");
+        for (size_t i = 0; i < shapes.size() && i < live.size(); i++)
+            expect(shapes[i].rows == live[i]->rows && shapes[i].cols == live[i]->cols,
+                   "expected tensor shape matches GPT");
+        int64_t params = 0;
+        expect(gpt_config_budget(cfg, params), "valid config passes budget");
+        int64_t actual = 0;
+        for (auto* p : live) actual += p->size();
+        expect(params == actual, "budget param count matches GPT");
+        std::printf("  params: budget=%lld actual=%lld tensors=%zu\n",
+                    (long long)params, (long long)actual, shapes.size());
+    }
+
     // Rebuild exactly like infer_gpt() does and compare logits.
     GPT gpt2(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
     auto params = gpt2.params();
@@ -142,6 +159,18 @@ int main() {
            !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "combined config budget rejected");
 
+    // vocab passes its own cap but makes the *model* (params + grads) huge.
+    expect(poke_i32(8, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "model budget rejected before GPT construction");
+
+    // Long context blows up the T*T attention buffers even with a tiny dim.
+    expect(poke_i32(20, 1000000) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "attention activation budget rejected");
+
+    // TransformerBlock/self-attention require dim divisible by 4.
+    expect(poke_i32(12, 15) && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "dim not divisible by 4 rejected");
+
     // "<PAD>" starts at 24 (header) + 4 (word count) + 4 (its length).
     expect(poke_byte(32, 'X') && !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "corrupt special token in checkpoint rejected");
@@ -153,6 +182,14 @@ int main() {
     expect(poke2_i32(tensor_off, 100000, tensor_off + 4, 100000) &&
            !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
            "oversized tensor rejected before allocation");
+
+    // Tensor count and shapes are now validated against the config while reading.
+    expect(poke_i32(tensor_off - 4, 1) &&
+           !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "wrong tensor count rejected");
+    expect(poke_i32(tensor_off + 4, 8) &&
+           !read_gpt_checkpoint(bad.string(), cfg, tok2, weights),
+           "wrong tensor shape rejected");
 
     // ---- standalone tokenizer file: round-trip + special-token check ----
     expect(tok.save(tokf.string()), "tok.save");
