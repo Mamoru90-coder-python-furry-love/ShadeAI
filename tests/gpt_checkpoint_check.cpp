@@ -205,6 +205,63 @@ int main() {
         expect(nonzero(p) == 2, "top_k >= n keeps everything");
     }
 
+    // ---- non-finite values are rejected at every GPT trust boundary ----
+    {
+        GPT ng(tok.vocab_size, 8, 1, 4);
+        for (auto* p : ng.params()) p->fill(0.01f);
+        const i32 V = ng.vocab_size;
+        Tensor logits(2, V), targets(2, V), d;
+        for (i32 i = 0; i < 2; i++) {
+            for (i32 j = 0; j < V; j++) {
+                logits.data[i * V + j] = (f32)j;
+                targets.data[i * V + j] = (j == i ? 1.0f : 0.0f);
+            }
+        }
+        const f32 good_loss = ng.compute_loss(logits, targets, d);
+        expect(std::isfinite(good_loss), "finite loss stays finite");
+        logits.data[0] = std::numeric_limits<f32>::quiet_NaN();
+        expect(!std::isfinite(ng.compute_loss(logits, targets, d)), "NaN logit rejected");
+        logits.data[0] = 0.0f;
+        targets.data[0] = std::numeric_limits<f32>::infinity();
+        expect(!std::isfinite(ng.compute_loss(logits, targets, d)), "Inf target rejected");
+        targets.data[0] = (f32)V;
+        expect(!std::isfinite(ng.compute_loss(logits, targets, d)), "out-of-range target rejected");
+        targets.data[0] = 1.0f;
+
+        auto gr = ng.grads();
+        gr[0]->fill(0.0f);
+        expect(ng.clip_grads(1.0f), "finite gradients accepted");
+        gr[0]->data[0] = std::numeric_limits<f32>::quiet_NaN();
+        expect(!ng.clip_grads(1.0f), "NaN gradient rejected before optimizer step");
+        gr[0]->data[0] = 0.0f;
+
+        std::vector<float> probs((size_t)V, 0.0f);
+        probs[0] = 1.0f;
+        expect(ng.sample(probs.data(), V, 0.8f, 20) >= 0, "finite logits sample");
+        probs[1] = std::numeric_limits<f32>::quiet_NaN();
+        expect(ng.sample(probs.data(), V, 0.8f, 20) == -1, "NaN sampling logit rejected");
+
+        const std::vector<int> seed{ Tokenizer::BOS };
+        std::string text;
+        expect(ng.generate(seed, 3, 0.8f, 20, tok, text), "finite generation succeeds");
+        auto np = ng.params();
+        std::vector<f32> saved;
+        saved.reserve(np.size());
+        for (auto* p : np) {
+            saved.push_back(p->data[0]);
+            p->data[0] = std::numeric_limits<f32>::quiet_NaN();
+        }
+        expect(!ng.generate(seed, 3, 0.8f, 20, tok, text), "poisoned generation is reported");
+        const fs::path poisoned = dir / "shade_gpt_nan_save.bin";
+        fs::remove(poisoned);
+        fs::remove(fs::path(poisoned.string() + ".tmp"));
+        expect(!save_gpt(poisoned.string(), ng, tok), "save rejects NaN weights before publish");
+        expect(!fs::exists(poisoned), "no poisoned checkpoint published");
+        for (size_t i = 0; i < np.size(); i++) np[i]->data[0] = saved[i];
+        fs::remove(poisoned);
+        fs::remove(fs::path(poisoned.string() + ".tmp"));
+    }
+
     // ---- corrupt files must be rejected, not parsed into a broken model ----
     auto bytes = read_all(ck);
     expect(bytes.size() > 64, "checkpoint size");

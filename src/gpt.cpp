@@ -108,6 +108,20 @@ struct GPT {
     float compute_loss(const Tensor& logits, const Tensor& targets, Tensor& dlogits) {
         i32 T = logits.rows;
         dlogits = Tensor(T, vocab_size, 0.0f);
+        // Non-finite logits/targets must not reach the float->int cast or the
+        // exp/log path. AVX max/exp can turn NaN into a finite value, so the
+        // only safe signal here is an explicit rejection before the kernel.
+        if (T <= 0 || logits.cols != vocab_size ||
+            logits.size() != (size_t)T * (size_t)vocab_size ||
+            targets.size() < T) return std::numeric_limits<f32>::quiet_NaN();
+        for (i32 i = 0; i < T; i++) {
+            const f32 raw = targets.data[i];
+            if (!std::isfinite(raw) || raw < 0.0f || raw >= (f32)vocab_size)
+                return std::numeric_limits<f32>::quiet_NaN();
+            const f32* lp = &logits.data[i * vocab_size];
+            for (i32 j = 0; j < vocab_size; j++)
+                if (!std::isfinite(lp[j])) return std::numeric_limits<f32>::quiet_NaN();
+        }
         float loss = 0;
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) reduction(+:loss)
@@ -136,11 +150,15 @@ struct GPT {
         return loss / T;
     }
 
-    void clip_grads(float max_norm) {
+    bool clip_grads(float max_norm) {
+        for (auto* g : grads())
+            for (i32 i = 0; i < g->size(); i++)
+                if (!std::isfinite(g->data[i])) return false;
         float norm = 0;
         for (auto* g : grads())
             for (i32 i = 0; i < g->size(); i++)
                 norm += g->data[i] * g->data[i];
+        if (!std::isfinite(norm)) return false;
         norm = sqrtf(norm);
         if (norm > max_norm) {
             float scale = max_norm / norm;
@@ -148,6 +166,7 @@ struct GPT {
                 for (i32 i = 0; i < g->size(); i++)
                     g->data[i] *= scale;
         }
+        return true;
     }
 
     std::vector<Tensor*> params() {
@@ -164,6 +183,10 @@ struct GPT {
     }
 
     int sample(float* logits, int n, float temp, int top_k) {
+        // Without this, a NaN logit makes max/sum poison the distribution and
+        // the caller silently gets the last token.
+        if (n <= 0 || !logits || !std::isfinite(temp) ||
+            Serialize::has_naninf(logits, n)) return -1;
         float maxv = logits[0];
         for (int j = 1; j < n; j++)
             if (logits[j] > maxv) maxv = logits[j];
@@ -184,21 +207,24 @@ struct GPT {
         return n - 1;
     }
 
-    std::string generate(const std::vector<int>& seed, int max_new_tokens,
-                         float temp, int top_k, const Tokenizer& tok) {
+    bool generate(const std::vector<int>& seed, int max_new_tokens,
+                  float temp, int top_k, const Tokenizer& tok, std::string& out) {
         std::vector<int> ids = seed;
         for (int step = 0; step < max_new_tokens; step++) {
             int ctx = std::min(max_len, (int)ids.size());
+            if (ctx <= 0) return false;
             int start = (int)ids.size() - ctx;
             Tensor input(1, ctx);
             for (int i = 0; i < ctx; i++) input.data[i] = (float)ids[start + i];
             Tensor logits = forward(input);
             int last = ctx - 1;
             int chosen = sample(&logits.data[last * vocab_size], vocab_size, temp, top_k);
+            if (chosen < 0) return false;
             ids.push_back(chosen);
             if (chosen == Tokenizer::EOS) break;
         }
-        return tok.decode(ids);
+        out = tok.decode(ids);
+        return true;
     }
 };
 
@@ -464,6 +490,10 @@ static bool gpt_compute_file_crc(FILE* f, uint32_t& out) {
 bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
               const GPTResume* resume = nullptr) {
     using namespace Serialize::detail;
+    // The reader rejects poisoned weights; refuse them here too so save_gpt
+    // cannot publish a checkpoint that its own loader would discard.
+    for (auto* p : gpt.params())
+        if (Serialize::has_naninf_tensor(*p)) return false;
     // Write to a sibling temp file first. The previous good checkpoint stays
     // untouched until the whole file, INCLUDING its checksum, is on disk and
     // the atomic rename succeeds.
@@ -793,14 +823,18 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
         auto pp = gpt.params();
         auto gp = gpt.grads();
         opt.zero_grad(gp);
-        auto finish_step = [&]() {
+        auto finish_step = [&]() -> bool {
             f32 scale = 1.0f / (f32)iters_since_step; // average accumulated micro-batches
             for (auto* g : gp)
                 for (i32 k = 0; k < g->size(); k++) g->data[k] *= scale;
-            gpt.clip_grads(1.0f);
+            if (!gpt.clip_grads(1.0f)) {
+                printf("ERROR: non-finite gradients at epoch %d\n", ep);
+                return false;
+            }
             opt.step(pp, gp);
             opt.zero_grad(gp);
             iters_since_step = 0;
+            return true;
         };
         float tl = 0;
         int iters = 0;
@@ -823,14 +857,19 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
 
             Tensor logits = gpt.forward(ids);
             Tensor dlogits;
-            tl += gpt.compute_loss(logits, targets, dlogits);
+            f32 loss = gpt.compute_loss(logits, targets, dlogits);
+            if (!std::isfinite(loss)) {
+                printf("ERROR: non-finite loss at epoch %d\n", ep);
+                return false;
+            }
+            tl += loss;
             gpt.backward(dlogits, ids);
             iters++;
             iters_since_step++;
 
-            if (iters_since_step >= tcfg.batch_size) finish_step();
+            if (iters_since_step >= tcfg.batch_size && !finish_step()) return false;
         }
-        if (iters_since_step > 0) finish_step();
+        if (iters_since_step > 0 && !finish_step()) return false;
 
         double t1 = clock();
         float avg_loss = tl / fmaxf(1, iters);
@@ -838,7 +877,11 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
         // Generate sample — this also consumes rand(), so its call count is
         // part of the resume state captured by the checkpoint below.
         std::vector<int> seed = {Tokenizer::BOS};
-        std::string gen = gpt.generate(seed, 40, 0.8f, 20, tok);
+        std::string gen;
+        if (!gpt.generate(seed, 40, 0.8f, 20, tok, gen)) {
+            printf("ERROR: non-finite logits during generation at epoch %d\n", ep);
+            return false;
+        }
         if (tcfg.verbose) {
             printf("  ep %2d loss=%.4f [%.0fs] | %s\n",
                    ep, avg_loss, (t1 - t0) / CLOCKS_PER_SEC, gen.c_str());
@@ -872,7 +915,11 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
         const char* prompts[] = {"once upon a time", "the robot", "hello", nullptr};
         for (int i = 0; prompts[i]; i++) {
             auto ids = tok.encode(prompts[i]);
-            std::string gen = gpt.generate(ids, 80, 0.7f, 20, tok);
+            std::string gen;
+            if (!gpt.generate(ids, 80, 0.7f, 20, tok, gen)) {
+                printf("ERROR: non-finite logits during final generation\n");
+                return false;
+            }
             printf("  \"%s\" -> %s\n", prompts[i], gen.c_str());
         }
     }
@@ -919,7 +966,11 @@ bool infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     if (seed.size() == 1) seed.push_back(Tokenizer::UNK); // empty prompt fallback
 
     srand((unsigned)time(nullptr));
-    std::string out = gpt->generate(seed, 120, 0.8f, 40, tok);
+    std::string out;
+    if (!gpt->generate(seed, 120, 0.8f, 40, tok, out)) {
+        printf("ERROR: non-finite logits during generation\n");
+        return false;
+    }
     printf("\n%s\n", out.c_str());
     return true;
 }
