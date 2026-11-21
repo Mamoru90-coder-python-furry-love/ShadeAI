@@ -431,10 +431,26 @@ struct CheckpointPair {
             i32 t = 0;
             bool has_opt = false;
             if (!m.empty()) {
+                if (m.size() != v.size()) return bad; // caller bug: never skip silently
+                errno = 0;
                 FILE* fo = fopen(opt_path.c_str(), "rb");
-                if (fo) {
-                    has_opt = detail::read_optimizer_blocks(fo, m, v, t, sm, sv);
+                if (!fo) {
+                    const int err = errno;
+                    // Only a genuinely absent sidecar is a model-only legacy
+                    // checkpoint. EACCES and other open failures must not be
+                    // reported as "no optimizer state" — that would resume
+                    // training with zero moments and a reset step counter.
+                    if (err != ENOENT && err != ENOTDIR) return bad;
+                } else {
+                    // A file that exists but fails validation is a hard error.
+                    // The generation path already behaves this way; legacy
+                    // must not silently degrade to a model-only load.
+                    if (!detail::read_optimizer_blocks(fo, m, v, t, sm, sv)) {
+                        fclose(fo);
+                        return bad;
+                    }
                     fclose(fo);
+                    has_opt = true;
                 }
             }
             detail::commit(sp, params);
