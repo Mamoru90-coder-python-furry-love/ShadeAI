@@ -15,6 +15,7 @@ set CFLAGS=/nologo /std:c++17 /O2 /arch:AVX /openmp /EHsc /I"%SRC%"
 cl %CFLAGS% "%TESTS%\simd_check.cpp" /Fe:"%OUT%simd_check.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\gradcheck.cpp" /Fe:"%OUT%gradcheck.exe" || goto :fail
 cl /nologo /std:c++17 /O2 /arch:AVX /EHsc /I"%SRC%" "%TESTS%\serialize_checks.cpp" /Fe:"%OUT%serialize_checks.exe" || goto :fail
+cl %CFLAGS% "%TESTS%\tokenizer_checks.cpp" /Fe:"%OUT%tokenizer_checks.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\gpt_checkpoint_check.cpp" /Fe:"%OUT%gpt_checkpoint_check.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\checkpoint_integrity_check.cpp" /Fe:"%OUT%checkpoint_integrity_check.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\memtrack_check.cpp" /Fe:"%OUT%memtrack_check.exe" || goto :fail
@@ -24,6 +25,7 @@ cl %CFLAGS% "%SRC%\main.cpp" /Fe:"%OUT%demos.exe" || goto :fail
 "%OUT%simd_check.exe" || goto :fail
 "%OUT%gradcheck.exe" || goto :fail
 "%OUT%serialize_checks.exe" || goto :fail
+"%OUT%tokenizer_checks.exe" || goto :fail
 "%OUT%gpt_checkpoint_check.exe" || goto :fail
 "%OUT%checkpoint_integrity_check.exe" || goto :fail
 "%OUT%memtrack_check.exe" || goto :fail

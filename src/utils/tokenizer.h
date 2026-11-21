@@ -24,8 +24,14 @@ struct Tokenizer {
         std::vector<std::pair<int, std::string>> sorted;
         for (auto& kv : freq)
             sorted.push_back({kv.second, kv.first});
+        // Frequency descending, then token ascending. unordered_map iteration
+        // order is not stable across STL implementations, so equal frequencies
+        // must be broken by the token itself to keep checkpoints reproducible.
         std::sort(sorted.begin(), sorted.end(),
-                  [](auto& a, auto& b) { return a.first > b.first; });
+                  [](const auto& a, const auto& b) {
+                      if (a.first != b.first) return a.first > b.first;
+                      return a.second < b.second;
+                  });
 
         id2word = {"<PAD>", "<UNK>", "<BOS>", "<EOS>"};
         word2id = {{"<PAD>", PAD}, {"<UNK>", UNK}, {"<BOS>", BOS}, {"<EOS>", EOS}};
@@ -142,7 +148,9 @@ struct Tokenizer {
             i32 len;
             if (fread(&len, sizeof(i32), 1, f) != 1) return false;
             remaining -= sizeof(i32);
-            if (len < 0 || len > MAX_WORD_LEN) return false;
+            // An empty token can never be produced by tokenize() and makes
+            // decode() ambiguous, so it is invalid in a checkpoint vocabulary.
+            if (len <= 0 || len > MAX_WORD_LEN) return false;
             if ((int64_t)len > remaining) return false; // file must contain the payload
             remaining -= len;
 

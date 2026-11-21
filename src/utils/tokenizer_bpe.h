@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <unordered_set>
 
 struct BPETokenizer {
     std::unordered_map<std::string, int> vocab;
@@ -15,59 +16,88 @@ struct BPETokenizer {
     std::unordered_map<std::string, int> merge_rank;
 
     int PAD_id = 1, UNK_id = 0, BOS_id = 2, EOS_id = 3;
+    static constexpr int MAX_ID = 1000000; // bounds id2token against corrupt vocab
 
     BPETokenizer() {}
 
+    // Parses into temporaries and commits only after BOTH files validate.
+    // A failed reload therefore leaves the previous tokenizer intact.
     bool load(const std::string& vocab_path, const std::string& merges_path) {
         std::ifstream fvocab(vocab_path);
         if (!fvocab.is_open()) return false;
+
+        std::unordered_map<std::string, int> new_vocab;
         std::string line;
         while (std::getline(fvocab, line)) {
             if (line.empty()) continue;
-            size_t pos = line.rfind(' ');
+            const size_t pos = line.rfind(' ');
             if (pos == std::string::npos) continue;
             std::string token = line.substr(0, pos);
-            int id = std::stoi(line.substr(pos + 1));
+            const std::string id_str = line.substr(pos + 1);
+
+            int id = 0;
+            try {
+                size_t used = 0;
+                id = std::stoi(id_str, &used);
+                if (used != id_str.size()) return false; // trailing junk
+            } catch (...) {
+                return false; // stoi throws on malformed / out-of-range ids
+            }
+            if (id < 0 || id > MAX_ID) return false;
+
             if (token == "SPACE") token = " ";
             else if (token == "NEWLINE") token = "\n";
-            vocab[token] = id;
-        }
-        fvocab.close();
-
-        int max_id = 0;
-        for (auto& kv : vocab) max_id = std::max(max_id, kv.second);
-        id2token.resize(max_id + 1);
-        for (auto& kv : vocab) {
-            if (kv.second >= 0 && kv.second <= max_id)
-                id2token[kv.second] = kv.first;
+            else if (token.empty()) token = "\n";
+            // train_bpe.py writes token "\n" as a literal newline followed by
+            // " <id>"; getline yields an empty token for that line. Recover it
+            // instead of letting newlines silently disappear from encode().
+            if (token.empty()) return false;
+            if (!new_vocab.emplace(token, id).second) return false; // duplicate token
         }
 
-        // Read special token IDs from vocab
-        auto it_pad = vocab.find("[PAD]");
-        auto it_unk = vocab.find("[UNK]");
-        auto it_bos = vocab.find("[BOS]");
-        auto it_eos = vocab.find("[EOS]");
-        if (it_pad != vocab.end()) PAD_id = it_pad->second;
-        if (it_unk != vocab.end()) UNK_id = it_unk->second;
-        if (it_bos != vocab.end()) BOS_id = it_bos->second;
-        if (it_eos != vocab.end()) EOS_id = it_eos->second;
+        std::unordered_set<int> seen_ids;
+        int max_id = -1;
+        for (const auto& kv : new_vocab) {
+            if (!seen_ids.insert(kv.second).second) return false; // duplicate id
+            max_id = std::max(max_id, kv.second);
+        }
+        if (max_id < 0) return false;
+
+        auto special_ok = [&](const char* name) {
+            auto it = new_vocab.find(name);
+            return it != new_vocab.end() && it->second >= 0 && it->second <= max_id;
+        };
+        if (!special_ok("[PAD]") || !special_ok("[UNK]") ||
+            !special_ok("[BOS]") || !special_ok("[EOS]")) return false;
 
         std::ifstream fmerges(merges_path);
         if (!fmerges.is_open()) return false;
+        std::vector<std::pair<std::string, std::string>> new_merges;
         while (std::getline(fmerges, line)) {
             if (line.empty() || line[0] == '#') continue;
             std::istringstream iss(line);
             std::string a, b;
             if (!(iss >> a >> b)) continue;
-            merges.emplace_back(a, b);
-        }
-        fmerges.close();
-
-        for (int i = 0; i < (int)merges.size(); i++) {
-            std::string key = merges[i].first + " " + merges[i].second;
-            merge_rank[key] = i;
+            new_merges.emplace_back(a, b);
         }
 
+        std::unordered_map<std::string, int> new_rank;
+        for (size_t i = 0; i < new_merges.size(); i++) {
+            const std::string key = new_merges[i].first + " " + new_merges[i].second;
+            new_rank.emplace(key, (int)i); // first definition wins, deterministically
+        }
+
+        std::vector<std::string> new_id2token((size_t)max_id + 1);
+        for (const auto& kv : new_vocab) new_id2token[(size_t)kv.second] = kv.first;
+
+        vocab = std::move(new_vocab);
+        id2token = std::move(new_id2token);
+        merges = std::move(new_merges);
+        merge_rank = std::move(new_rank);
+        PAD_id = vocab["[PAD]"];
+        UNK_id = vocab["[UNK]"];
+        BOS_id = vocab["[BOS]"];
+        EOS_id = vocab["[EOS]"];
         return true;
     }
 
@@ -184,17 +214,35 @@ struct BPETokenizer {
         return result;
     }
 
+    // Same whitespace/newline rules as encode(), but returns token strings.
+    // istringstream >> used to drop newlines here while encode() preserved them.
     std::vector<std::string> tokenize(const std::string& text) const {
         std::vector<std::string> tokens;
-        std::istringstream iss(text);
-        std::string word;
-        bool first = true;
-        while (iss >> word) {
-            if (!first) tokens.push_back(" ");
-            first = false;
-            auto t = bpe_encode_word(word);
-            tokens.insert(tokens.end(), t.begin(), t.end());
+        std::string word, sep;
+        auto flush = [&]() {
+            if (!word.empty()) {
+                if (!tokens.empty()) {
+                    if (sep.find('\n') != std::string::npos) {
+                        if (vocab.count("\n")) tokens.push_back("\n");
+                    } else if (!sep.empty()) {
+                        if (vocab.count(" ")) tokens.push_back(" ");
+                    }
+                }
+                auto t = bpe_encode_word(word);
+                tokens.insert(tokens.end(), t.begin(), t.end());
+                word.clear();
+            }
+            sep.clear();
+        };
+        for (char c : text) {
+            if (c == ' ' || c == '\n' || c == '\t' || c == '\r') {
+                flush();
+                sep += c;
+            } else {
+                word += c;
+            }
         }
+        flush();
         return tokens;
     }
 };
