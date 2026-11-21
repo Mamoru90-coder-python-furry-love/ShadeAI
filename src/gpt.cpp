@@ -612,6 +612,10 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                 if (epoch < 0 || seed < 0 || calls < 0 ||
                     calls > GPT_MAX_RAND_REPLAY || (has_opt != 0 && has_opt != 1))
                     return false;
+                // A checkpoint without optimizer moments is usable for inference,
+                // but an explicit resume must fail here: train_gpt needs m/v/t
+                // to continue the same optimization trajectory.
+                if (!has_opt && resume) return false;
                 parsed_resume.epoch = epoch;
                 parsed_resume.rand_seed = seed;
                 parsed_resume.rand_calls = calls;
@@ -683,7 +687,7 @@ struct GPTTrainConfig {
     bool verbose = true;
 };
 
-void train_gpt(const std::string& data_path, const std::string& model_path,
+bool train_gpt(const std::string& data_path, const std::string& model_path,
                bool do_resume = false, const GPTTrainConfig& tcfg = {}) {
     if (tcfg.verbose) {
         printf("=== GPT-2 Mini ===\n");
@@ -696,6 +700,7 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
     std::vector<Tensor> weights;
     GPTResume resumed;
     bool have_resume = false;
+    int start_epoch = 0;
 
     if (do_resume) {
         // Staged inside read_gpt_checkpoint: a corrupt resume section cannot
@@ -704,9 +709,20 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
                                  Tokenizer::MAX_BYTES, &resumed)) {
             printf("ERROR: cannot resume from %s (missing, corrupt, or not a v3 checkpoint).\n",
                    model_path.c_str());
-            return;
+            return false;
         }
         have_resume = true;
+        start_epoch = resumed.epoch;
+        // Check progress before touching the dataset: a completed checkpoint
+        // (or one ahead of this run's epoch limit) needs no training text.
+        if (start_epoch < 0 || start_epoch > tcfg.epochs) {
+            printf("ERROR: checkpoint epoch %d outside [0, %d]\n", start_epoch, tcfg.epochs);
+            return false;
+        }
+        if (start_epoch == tcfg.epochs) {
+            if (tcfg.verbose) printf("  training already complete (epoch %d)\n", start_epoch);
+            return true;
+        }
         // Seed BEFORE constructing the model: layer constructors consume rand()
         // too, and the replay below must continue from that same position.
         shade_srand(resumed.rand_seed);
@@ -717,7 +733,7 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
     // Text is still needed for training tokens; on resume the tokenizer and
     // architecture come from the checkpoint, never from a freshly built one.
     std::ifstream file(data_path);
-    if (!file.is_open()) { printf("ERROR: can't open %s\n", data_path.c_str()); return; }
+    if (!file.is_open()) { printf("ERROR: can't open %s\n", data_path.c_str()); return false; }
     std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     if (text.size() > tcfg.max_chars) text = text.substr(0, tcfg.max_chars);
@@ -729,7 +745,7 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
     } else if ((i32)tok.vocab_size != cfg.vocab) {
         printf("ERROR: restored tokenizer vocab %d != checkpoint vocab %d\n",
                tok.vocab_size, cfg.vocab);
-        return;
+        return false;
     }
     if (tcfg.verbose) printf("  vocab: %d tokens\n", tok.vocab_size);
 
@@ -745,14 +761,14 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
         if (weights.size() != params.size() ||
             resumed.m.size() != params.size() || resumed.v.size() != params.size()) {
             printf("ERROR: resume tensor count mismatch\n");
-            return;
+            return false;
         }
         for (size_t i = 0; i < params.size(); ++i) {
             if (weights[i].rows != params[i]->rows || weights[i].cols != params[i]->cols ||
                 resumed.m[i].rows != params[i]->rows || resumed.m[i].cols != params[i]->cols ||
                 resumed.v[i].rows != params[i]->rows || resumed.v[i].cols != params[i]->cols) {
                 printf("ERROR: resume tensor shape mismatch at %zu\n", i);
-                return;
+                return false;
             }
         }
         for (size_t i = 0; i < params.size(); ++i) {
@@ -771,15 +787,6 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
                total_params, cfg.blocks, cfg.dim, cfg.max_len);
 
     int seq_len = cfg.max_len;
-    int start_epoch = have_resume ? resumed.epoch : 0;
-    if (start_epoch < 0 || start_epoch > tcfg.epochs) {
-        printf("ERROR: checkpoint epoch %d outside [0, %d]\n", start_epoch, tcfg.epochs);
-        return;
-    }
-    if (start_epoch == tcfg.epochs) {
-        if (tcfg.verbose) printf("  training already complete (epoch %d)\n", start_epoch);
-        return;
-    }
     int iters_since_step = 0;
 
     for (int ep = start_epoch; ep < tcfg.epochs; ep++) {
@@ -853,7 +860,7 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
         for (const auto& vt : opt.v) out.v.emplace_back(vt.rows, vt.cols, vt.data);
         if (!save_gpt(model_path, gpt, tok, &out)) {
             printf("  ERROR: failed to save model to %s\n", model_path.c_str());
-            return;
+            return false;
         }
         if (tcfg.verbose)
             printf("  checkpoint: epoch=%d t=%d rand_calls=%d\n",
@@ -869,9 +876,10 @@ void train_gpt(const std::string& data_path, const std::string& model_path,
             printf("  \"%s\" -> %s\n", prompts[i], gen.c_str());
         }
     }
+    return true;
 }
 
-void infer_gpt(const std::string& model_path, const std::string& prompt_text) {
+bool infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     printf("Loading %s ...\n", model_path.c_str());
 
     GPTConfig cfg;
@@ -880,7 +888,7 @@ void infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     if (!read_gpt_checkpoint(model_path, cfg, tok, weights)) {
         printf("ERROR: cannot load checkpoint (missing, corrupt, or old-format file).\n");
         printf("       Train first with: shade.exe --train <data.txt> <model.bin>\n");
-        return;
+        return false;
     }
     printf("  config: vocab=%d dim=%d blocks=%d ctx=%d\n",
            cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
@@ -890,13 +898,13 @@ void infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     if ((i32)params.size() != (i32)weights.size()) {
         printf("ERROR: checkpoint weight count mismatch (%zu vs %zu)\n",
                params.size(), weights.size());
-        return;
+        return false;
     }
     for (size_t i = 0; i < params.size(); i++) {
         if (params[i]->rows != weights[i].rows || params[i]->cols != weights[i].cols) {
             printf("ERROR: checkpoint weight %zu has shape %dx%d, expected %dx%d\n",
                    i, weights[i].rows, weights[i].cols, params[i]->rows, params[i]->cols);
-            return;
+            return false;
         }
         params[i]->data = std::move(weights[i].data);
     }
@@ -913,6 +921,7 @@ void infer_gpt(const std::string& model_path, const std::string& prompt_text) {
     srand((unsigned)time(nullptr));
     std::string out = gpt->generate(seed, 120, 0.8f, 40, tok);
     printf("\n%s\n", out.c_str());
+    return true;
 }
 
 int main(int argc, char** argv) {
@@ -957,9 +966,9 @@ int main(int argc, char** argv) {
     }
 
     if (train) {
-        train_gpt(data_path, model_path, resume);
+        return train_gpt(data_path, model_path, resume) ? 0 : 1;
     } else {
-        infer_gpt(model_path, prompt);
+        return infer_gpt(model_path, prompt) ? 0 : 1;
     }
     return 0;
 }

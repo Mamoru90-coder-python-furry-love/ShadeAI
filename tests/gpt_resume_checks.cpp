@@ -70,7 +70,21 @@ int main() {
     const fs::path bad = dir / "shade_gpt_resume_bad.bin";
     const fs::path v2 = dir / "shade_gpt_resume_v2.bin";
     const fs::path zero = dir / "shade_gpt_resume_zero.bin";
-    for (const auto& p : { data, full, part, bad, v2, zero }) fs::remove(p);
+    const fs::path noopt = dir / "shade_gpt_resume_noopt.bin";
+    const fs::path complete = dir / "shade_gpt_resume_complete.bin";
+    const fs::path missing = dir / "shade_gpt_resume_absent.bin";
+    const fs::path twoonly = dir / "shade_gpt_resume_twoonly.bin";
+    const fs::path spaced = dir / "shade gpt resume complete.bin";
+    const fs::path spaced_data = dir / "shade gpt resume data.txt";
+    const fs::path other_data = dir / "shade_gpt_resume_other_data.txt";
+    const fs::path changed = dir / "shade_gpt_resume_changed_data.bin";
+    const fs::path shortened = dir / "shade_gpt_resume_shortened.bin";
+    const fs::path arch = dir / "shade_gpt_resume_arch.bin";
+    const fs::path maxcalls = dir / "shade_gpt_resume_maxcalls.bin";
+    for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
+                           twoonly, spaced, spaced_data, other_data, changed,
+                           shortened, arch, maxcalls })
+        fs::remove(p);
 
     bool ok = true;
     auto expect = [&](bool cond, const char* what) {
@@ -93,6 +107,7 @@ int main() {
     // ---- 1. continuity: 3 epochs vs 2 epochs + resume, byte for byte ----
     train_gpt(data.string(), full.string(), false, small);
     train_gpt(data.string(), part.string(), false, two);
+    train_gpt(data.string(), twoonly.string(), false, two);
     train_gpt(data.string(), part.string(), true, small);
     expect(fs::exists(full) && fs::exists(part), "checkpoints written");
     {
@@ -200,7 +215,150 @@ int main() {
                "explicit resume rejects v2 (no resume state)");
     }
 
-    for (const auto& p : { data, full, part, bad, v2, zero }) fs::remove(p);
+    // ---- 6. has_opt=0: valid for inference, invalid for EXPLICIT resume and
+    //         rejected at the reader boundary (not deep inside train_gpt). ----
+    {
+        GPT g(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+        auto pp = g.params();
+        for (size_t i = 0; i < pp.size(); ++i) pp[i]->data = weights[i].data;
+        GPTResume bare = res;
+        bare.has_opt = false;
+        bare.m.clear();
+        bare.v.clear();
+        expect(save_gpt(noopt.string(), g, tok, &bare), "write has_opt=0 v3 checkpoint");
+        GPTConfig c{}; Tokenizer t; std::vector<Tensor> w; GPTResume r;
+        expect(read_gpt_checkpoint(noopt.string(), c, t, w), "has_opt=0 v3 readable for inference");
+        expect(!read_gpt_checkpoint(noopt.string(), c, t, w,
+                                    Tokenizer::MAX_BYTES, &r),
+               "explicit resume rejects has_opt=0 at reader");
+    }
+
+    // ---- 7. CLI-level paths and failure exit codes. A checkpoint marked as
+    //         complete returns immediately, so this stays fast. ----
+    {
+        GPT g(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+        auto pp = g.params();
+        for (size_t i = 0; i < pp.size(); ++i) pp[i]->data = weights[i].data;
+        GPTResume done = res;
+        done.epoch = 12;
+        expect(save_gpt(complete.string(), g, tok, &done), "write complete checkpoint");
+
+        const fs::path stale = fs::path(complete.string() + ".tmp");
+        expect(write_all(stale, std::vector<char>(37, 0x5a)), "create stale tmp file");
+        expect(save_gpt(complete.string(), g, tok, &done), "save replaces stale tmp");
+        expect(!fs::exists(stale), "stale tmp consumed by atomic replace");
+
+        auto cli = [&](std::initializer_list<const char*> args) {
+            std::vector<char*> av;
+            for (const char* a : args) av.push_back(const_cast<char*>(a));
+            return gpt_cli_main((int)av.size(), av.data());
+        };
+        // A completed checkpoint needs no dataset at all: progress is checked
+        // before any data file is opened.
+        expect(cli({ "shade", "--resume", complete.string().c_str() }) == 0,
+               "--resume complete exits 0 without --data");
+        expect(cli({ "shade", "--continue", complete.string().c_str(),
+                     "--data", data.string().c_str() }) == 0,
+               "--continue alias exits 0");
+        expect(cli({ "shade", "--resume", missing.string().c_str(),
+                     "--model", complete.string().c_str() }) == 0,
+               "--model overrides earlier --resume path");
+        expect(write_all(spaced_data, std::vector<char>(text.begin(), text.end())),
+               "write data path with spaces");
+        expect(save_gpt(spaced.string(), g, tok, &done), "save checkpoint path with spaces");
+        expect(cli({ "shade", "--resume", spaced.string().c_str(),
+                     "--data", spaced_data.string().c_str() }) == 0,
+               "paths with spaces round-trip through CLI");
+        expect(cli({ "shade", "--resume", complete.string().c_str(),
+                     "--data", data.string().c_str() }) == 0,
+               "--resume with --data exits 0 (dataset change allowed)");
+        expect(cli({ "shade", "--resume", missing.string().c_str() }) == 1,
+               "missing checkpoint exits 1");
+        expect(cli({ "shade", "--resume", bad.string().c_str() }) == 1,
+               "corrupt checkpoint exits 1");
+        expect(cli({ "shade", "--resume", v2.string().c_str() }) == 1,
+               "v2 checkpoint exits 1 on resume");
+        expect(cli({ "shade", "--resume", noopt.string().c_str() }) == 1,
+               "has_opt=0 checkpoint exits 1 on resume");
+    }
+
+    // ---- 8. Dataset identity, epoch limit and non-stored train params. ----
+    // There is no dataset fingerprint in SHDG v3: resuming with different text
+    // is an intentional fine-tuning path. The tokenizer/architecture still come
+    // from the checkpoint, never from a freshly built one.
+    {
+        const std::string other_text = text +
+            " a completely different continuation with fresh words for fine tuning";
+        expect(write_all(other_data,
+                         std::vector<char>(other_text.begin(), other_text.end())),
+               "write alternate dataset");
+        expect(fs::copy_file(twoonly, changed), "stage epoch-2 checkpoint");
+        expect(train_gpt(other_data.string(), changed.string(), true, small),
+               "resume with changed dataset continues");
+        GPTConfig c{}; Tokenizer t; std::vector<Tensor> w; GPTResume r;
+        expect(read_gpt_checkpoint(changed.string(), c, t, w,
+                                   Tokenizer::MAX_BYTES, &r),
+               "changed-dataset checkpoint still readable");
+        expect(r.epoch == 3 && c.dim == cfg.dim && c.blocks == cfg.blocks &&
+               c.max_len == cfg.max_len && t.id2word == tok.id2word,
+               "changed dataset keeps checkpoint progress/tokenizer/architecture");
+    }
+
+    // Lowering the epoch limit below saved progress must fail without touching
+    // the checkpoint. Raising it continues from the saved epoch.
+    {
+        expect(fs::copy_file(full, shortened), "stage complete checkpoint for epoch limit");
+        GPTTrainConfig lower = small;
+        lower.epochs = 2;
+        expect(!train_gpt(data.string(), shortened.string(), true, lower),
+               "resume rejects epoch limit below checkpoint progress");
+        expect(same_bytes(full, shortened), "rejected epoch limit leaves bytes unchanged");
+
+        GPTTrainConfig higher = small;
+        higher.epochs = 4;
+        expect(train_gpt(data.string(), shortened.string(), true, higher),
+               "resume continues when epoch limit is raised");
+        GPTConfig c{}; Tokenizer t; std::vector<Tensor> w; GPTResume r;
+        expect(read_gpt_checkpoint(shortened.string(), c, t, w,
+                                   Tokenizer::MAX_BYTES, &r) && r.epoch == 4,
+               "raised epoch limit advances checkpoint to epoch 4");
+    }
+
+    // Training-only knobs are not serialized; architecture is. A caller that
+    // passes different dim/blocks/max_len still gets the checkpoint's shapes.
+    {
+        expect(fs::copy_file(full, arch), "stage architecture-override checkpoint");
+        GPTTrainConfig override = small;
+        override.dim = 16; override.blocks = 2; override.max_len = 8; override.epochs = 4;
+        expect(train_gpt(data.string(), arch.string(), true, override),
+               "resume ignores non-stored architecture overrides");
+        GPTConfig c{}; Tokenizer t; std::vector<Tensor> w; GPTResume r;
+        expect(read_gpt_checkpoint(arch.string(), c, t, w,
+                                   Tokenizer::MAX_BYTES, &r) &&
+               c.dim == 8 && c.blocks == 1 && c.max_len == 4 && r.epoch == 4,
+               "checkpoint architecture survives caller override");
+    }
+
+    // rand_calls is bounded on read. The boundary itself is structurally valid;
+    // replaying it is not exercised here (it would burn 100M CRT calls).
+    {
+        GPT g(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+        auto pp = g.params();
+        for (size_t i = 0; i < pp.size(); ++i) pp[i]->data = weights[i].data;
+        GPTResume maxr = res;
+        maxr.rand_calls = GPT_MAX_RAND_REPLAY;
+        expect(save_gpt(maxcalls.string(), g, tok, &maxr), "write max rand_calls checkpoint");
+        GPTConfig c{}; Tokenizer t; std::vector<Tensor> w; GPTResume r;
+        expect(read_gpt_checkpoint(maxcalls.string(), c, t, w,
+                                   Tokenizer::MAX_BYTES, &r) &&
+               r.rand_calls == GPT_MAX_RAND_REPLAY,
+               "rand_calls boundary accepted by reader");
+    }
+
+    for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
+                           twoonly, spaced, spaced_data, other_data, changed,
+                           shortened, arch, maxcalls })
+        fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");
     return 0;
