@@ -1,6 +1,7 @@
 // Checkpoint integrity: truncated / poisoned / trailing-garbage files must fail
 // without modifying any live tensor or the AdamW step counter.
 #include "../src/utils/serialize.h"
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -292,7 +293,84 @@ static int pair_checks() {
     r = read_pair(pm, po);
     expect(r.valid && r.model0 == 4.0f && !r.has_opt && r.m0 == -7.0f, "model-only pair");
 
-    // 8. Legacy plain files remain readable when there is no manifest.
+    // 8. P3: v without m is a caller bug, never a model-only publish.
+    expect(!Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                               4, 2, 16, none, vs, 0),
+           "v without m rejected");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 4.0f && !r.has_opt, "rejected publish leaves pair intact");
+
+    // 9. P3: a manifest that exists but cannot be opened is NOT "missing".
+    //    A directory at the manifest path yields EACCES on Windows; the loader
+    //    must fail instead of silently falling back to the legacy plain files.
+    expect(Serialize::save_model(pm.string(), ap, 4, 2, 16), "seed legacy model");
+    expect(Serialize::save_optimizer(po.string(), ms, vs, 21), "seed legacy opt");
+    remove_pair_files(pm, po);
+    fs::create_directory(manifest);
+    r = read_pair(pm, po);
+    expect(!r.valid && r.model0 == -7.0f, "unreadable manifest blocks legacy fallback");
+    fs::remove(manifest);
+
+    // 10. P2: concurrent publishers must not claim the same generation.
+    remove_pair_files(pm, po);
+    fs::remove(pm); fs::remove(po);
+    {
+        constexpr int kWriters = 8;
+        std::atomic<int> succeeded{ 0 };
+        std::vector<std::thread> writers;
+        for (int i = 0; i < kWriters; i++) {
+            writers.emplace_back([&, i] {
+                Tensor ta(2, 3), tm(2, 3), tv(2, 3);
+                fill(ta, (f32)(i + 1)); fill(tm, 0.25f); fill(tv, 0.5f);
+                std::vector<Tensor*> pa{ &ta }, mm{ &tm }, vv{ &tv };
+                if (Serialize::CheckpointPair::publish(pm.string(), po.string(), pa,
+                                                       4, 2, 16, mm, vv, i + 1))
+                    succeeded.fetch_add(1);
+            });
+        }
+        for (auto& w : writers) w.join();
+        expect(succeeded.load() == kWriters, "all concurrent publishes succeeded");
+
+        auto mb = read_all(manifest);
+        i32 final_gen = -1;
+        if (mb.size() == 12) std::memcpy(&final_gen, mb.data() + 4, sizeof(final_gen));
+        expect(final_gen == kWriters, "no generation lost under concurrent publish");
+        r = read_pair(pm, po);
+        expect(r.valid && r.has_opt && r.t >= 1 && r.t <= kWriters &&
+               r.model0 == (f32)r.t,
+               "last concurrent pair is coherent");
+    }
+
+    // 11. P2: a reader racing publish/GC must never see a deleted generation
+    //     or a half-updated pair. Every read is checked for model/t coherence.
+    remove_pair_files(pm, po);
+    fs::remove(pm); fs::remove(po);
+    {
+        fill(a, 0.0f);
+        expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                                  4, 2, 16, ms, vs, 0), "gc-race seed");
+        std::atomic<bool> done{ false };
+        std::atomic<int> reads{ 0 }, bad{ 0 };
+        std::thread writer([&] {
+            for (int i = 1; i <= 64; i++) {
+                Tensor ta(2, 3), tm(2, 3), tv(2, 3);
+                fill(ta, (f32)i); fill(tm, 0.25f); fill(tv, 0.5f);
+                std::vector<Tensor*> pa{ &ta }, mm{ &tm }, vv{ &tv };
+                Serialize::CheckpointPair::publish(pm.string(), po.string(), pa,
+                                                   4, 2, 16, mm, vv, i);
+            }
+            done.store(true);
+        });
+        while (!done.load() || reads.load() < 100) {
+            auto q = read_pair(pm, po);
+            reads.fetch_add(1);
+            if (!q.valid || !q.has_opt || q.model0 != (f32)q.t) bad.fetch_add(1);
+        }
+        writer.join();
+        expect(bad.load() == 0, "reader never sees deleted or mixed generation");
+    }
+
+    // 12. Legacy plain files remain readable when there is no manifest.
     remove_pair_files(pm, po);
     fs::remove(pm); fs::remove(po);
     fill(a, 6.0f);

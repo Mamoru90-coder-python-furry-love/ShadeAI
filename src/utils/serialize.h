@@ -11,6 +11,7 @@
 #include "../core/tensor.h"
 #include <vector>
 #include <string>
+#include <cerrno>
 #include <cstdio>
 #include <cstdint>
 #include <limits>
@@ -291,6 +292,15 @@ namespace pair_detail {
 static constexpr i32 MANIFEST_MAGIC = 0x52494150; // "PAIR" on disk (little-endian)
 static constexpr i32 FLAG_HAS_OPT = 1;
 
+// One lock for the whole manifest/generation protocol: publish is serialized
+// (no two writers can claim the same gen), and load holds it from the manifest
+// read through opening both files, so GC cannot delete a generation under a
+// reader. Cross-process coordination is out of scope; this is in-process.
+inline std::mutex& io_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 inline std::string gen_path(const std::string& base, i32 gen) {
     return base + ".g" + std::to_string(gen);
 }
@@ -301,8 +311,15 @@ inline std::string manifest_path(const std::string& model_path) {
 // `exists` separates "no manifest yet" (legacy fallback) from "manifest
 // present but corrupt" (hard failure). gen/flags are only set on success.
 inline bool read_manifest(const std::string& model_path, bool& exists, i32& gen, i32& flags) {
+    errno = 0;
     FILE* f = fopen(manifest_path(model_path).c_str(), "rb");
-    if (!f) { exists = false; return false; }
+    if (!f) {
+        // Only a genuinely missing file may fall back to the legacy pair.
+        // EACCES and other failures must be reported as a broken manifest.
+        const int err = errno;
+        exists = (err != ENOENT && err != ENOTDIR);
+        return false;
+    }
     exists = true;
     i32 h[3];
     const bool ok = detail::read_exact(f, h, sizeof(h)) && detail::at_eof(f);
@@ -338,6 +355,11 @@ struct CheckpointPair {
     static bool publish(const std::string& model_path, const std::string& opt_path,
                         const std::vector<Tensor*>& params, i32 dim, i32 blocks, i32 ctx,
                         const std::vector<Tensor*>& m, const std::vector<Tensor*>& v, i32 t) {
+        // Serialize the whole read-gen -> write -> manifest-swap -> GC cycle.
+        // Otherwise two publishers can claim the same generation, and a GC can
+        // delete a generation that a concurrent reader has already selected.
+        std::lock_guard<std::mutex> lk(pair_detail::io_mutex());
+
         bool exists = false;
         i32 prev = 0, prev_flags = 0;
         if (pair_detail::read_manifest(model_path, exists, prev, prev_flags)) {
@@ -347,7 +369,9 @@ struct CheckpointPair {
         }
         const i32 gen = prev + 1;
         const bool has_opt = !m.empty();
-        if (has_opt && (m.size() != v.size() || t < 0)) return false;
+        // Check the pair shape unconditionally: v without m is a caller bug,
+        // not a legitimate model-only publish.
+        if (m.size() != v.size() || (has_opt && t < 0)) return false;
 
         const std::string mg = pair_detail::gen_path(model_path, gen);
         const std::string og = pair_detail::gen_path(opt_path, gen);
@@ -385,6 +409,11 @@ struct CheckpointPair {
     static Result load(const std::string& model_path, const std::string& opt_path,
                        const std::vector<Tensor*>& params,
                        const std::vector<Tensor*>& m, const std::vector<Tensor*>& v) {
+        // Hold the protocol lock from the manifest read until both files are
+        // staged and committed. A publisher (and its GC) cannot advance past
+        // the selected generation while this reader is still using it.
+        std::lock_guard<std::mutex> lk(pair_detail::io_mutex());
+
         const Result bad = { false, { 0, 0, 0, false }, false, 0 };
         bool exists = false;
         i32 gen = 0, flags = 0;
