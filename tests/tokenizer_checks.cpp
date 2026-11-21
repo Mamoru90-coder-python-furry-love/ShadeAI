@@ -26,13 +26,19 @@ static void put_i32(std::string& out, i32 v) {
 
 struct LoadResult { bool ok = false; bool threw = false; };
 
-static LoadResult try_load(BPETokenizer& t, const std::string& vocab,
-                           const fs::path& vp, const fs::path& mp) {
+static LoadResult try_load_files(BPETokenizer& t, const std::string& vocab,
+                                 const std::string& merges,
+                                 const fs::path& vp, const fs::path& mp) {
     LoadResult r;
-    if (!write_text(vp, vocab) || !write_text(mp, "#version: 0.2\na b\n")) return r;
+    if (!write_text(vp, vocab) || !write_text(mp, merges)) return r;
     try { r.ok = t.load(vp.string(), mp.string()); }
     catch (...) { r.threw = true; }
     return r;
+}
+
+static LoadResult try_load(BPETokenizer& t, const std::string& vocab,
+                           const fs::path& vp, const fs::path& mp) {
+    return try_load_files(t, vocab, "#version: 0.2\na b\n", vp, mp);
 }
 
 static int bpe_checks() {
@@ -141,6 +147,49 @@ static int bpe_checks() {
         bool str_nl = false;
         for (const auto& s : strs) if (s == "\n") str_nl = true;
         expect(str_nl, "tokenize() and encode() agree on newlines");
+    }
+
+    // 10. A non-empty vocabulary line with no id separator must be rejected,
+    //     not silently skipped (audit of 26fccf4).
+    {
+        BPETokenizer t;
+        const std::string corrupt =
+            "[UNK] 0\n[PAD] 1\n[BOS] 2\n[EOS] 3\n"
+            "corrupted_entry\nhello 4\n";
+        auto r = try_load(t, corrupt, vp, mp);
+        expect(!r.ok && !r.threw, "vocab line without id rejected");
+        expect(t.vocab.empty(), "corrupt vocab does not commit partial state");
+    }
+
+    // 11. Same class of defect in the merges file.
+    {
+        BPETokenizer t;
+        auto r = try_load_files(t, good, "#version: 0.2\na b\nbroken_rule\n", vp, mp);
+        expect(!r.ok && !r.threw, "malformed merge line rejected");
+        expect(t.vocab.empty(), "corrupt merges do not commit partial state");
+    }
+
+    // 12. Unreadable paths are hard errors, not an empty successful load.
+    {
+        const fs::path dir_vocab = dir / "shade_bpe_vocab_dir";
+        const fs::path dir_merges = dir / "shade_bpe_merges_dir";
+        fs::create_directory(dir_vocab);
+        fs::create_directory(dir_merges);
+        {
+            BPETokenizer t;
+            LoadResult r;
+            try { r.ok = t.load(dir_vocab.string(), mp.string()); }
+            catch (...) { r.threw = true; }
+            expect(!r.ok && !r.threw, "unreadable vocabulary path rejected");
+        }
+        {
+            BPETokenizer t;
+            LoadResult r;
+            try { r.ok = t.load(vp.string(), dir_merges.string()); }
+            catch (...) { r.threw = true; }
+            expect(!r.ok && !r.threw, "unreadable merges path rejected");
+        }
+        fs::remove(dir_vocab); fs::remove(dir_merges);
     }
 
     fs::remove(vp); fs::remove(mp);

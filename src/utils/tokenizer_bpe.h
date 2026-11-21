@@ -29,9 +29,9 @@ struct BPETokenizer {
         std::unordered_map<std::string, int> new_vocab;
         std::string line;
         while (std::getline(fvocab, line)) {
-            if (line.empty()) continue;
+            if (line.empty()) continue; // exporter emits an empty line for token "\n"
             const size_t pos = line.rfind(' ');
-            if (pos == std::string::npos) continue;
+            if (pos == std::string::npos) return false; // corrupt entry: no id separator
             std::string token = line.substr(0, pos);
             const std::string id_str = line.substr(pos + 1);
 
@@ -54,6 +54,7 @@ struct BPETokenizer {
             if (token.empty()) return false;
             if (!new_vocab.emplace(token, id).second) return false; // duplicate token
         }
+        if (fvocab.bad()) return false; // I/O error must not look like a short valid file
 
         std::unordered_set<int> seen_ids;
         int max_id = -1;
@@ -76,10 +77,11 @@ struct BPETokenizer {
         while (std::getline(fmerges, line)) {
             if (line.empty() || line[0] == '#') continue;
             std::istringstream iss(line);
-            std::string a, b;
-            if (!(iss >> a >> b)) continue;
+            std::string a, b, extra;
+            if (!(iss >> a >> b) || (iss >> extra)) return false; // malformed merge rule
             new_merges.emplace_back(a, b);
         }
+        if (fmerges.bad()) return false; // same: no silent partial merge table
 
         std::unordered_map<std::string, int> new_rank;
         for (size_t i = 0; i < new_merges.size(); i++) {
