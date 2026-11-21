@@ -249,11 +249,18 @@ P3-нотатки (MaxPool tie-gap, `(f32)vocab_size`, soft labels) зафікс
 
 Негативні контролі (фактично запускались): прямий запис `save_model` → 5 `FAIL`, `exit=1`; прибраний `join` у `spawn()` → `0xC0000409` (`std::terminate`); повернення прямої публікації без маніфеста → `FAIL: publish fails when optimizer temp blocked`, `reader still sees old pair`; **прибраний `io_mutex` → 4 `FAIL`** (`all concurrent publishes succeeded`, `no generation lost`, `last concurrent pair coherent`, `reader never sees deleted or mixed generation`); **прибране розрізнення ENOENT → `FAIL: unreadable manifest blocks legacy fallback`**; **повернута стара перевірка m/v → `FAIL: v without m rejected`**. Усі три останні: `pair_checks: FAILED`, після відновлення — `OK`.
 
+### Маркування `shade.exe` — VERSIONINFO
+
+Окремим комітом (не змішується з виправленнями ядра) додано `src/shade.rc` із `VS_VERSION_INFO`: `CompanyName=ShadeFurry Technologies`, `ProductName=ShadeAI`, `FileDescription=ShadeAI Application`, `LegalCopyright=ShadeFurry Technologies`, `FileVersion/ProductVersion=1.0.0.0`, `OriginalFilename=shade.exe`. `build\compile.bat` тепер вимагає `cl` **і** `rc` (обидва з `vcvars64.bat`), збирає `build\shade.res` і лінкує його в `shade.exe`; `*.res` додано до `.gitignore`. Фактично перевірено через `(Get-Item build\shade.exe).VersionInfo` — усі поля зчитуються.
+
+**Це метадані, а не Authenticode.** Windows не вважає файл криптографічно підписаним. Для справжнього підпису потрібен code-signing сертифікат і `signtool sign`; цей крок не виконано.
+
 ### Ще не зроблено
 
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
 - Power-loss durability: `fflush`/`fclose` без `fsync` файлу й каталогу дають атомарну **видимість** за crash процесу, але не гарантію після знеструмлення (POSIX `rename`, Windows `MOVEFILE_WRITE_THROUGH`).
 - Формати SHDE generation-файлів і SHDG v2 (GPT) лишаються окремими — уніфікація не потрібна.
+- Authenticode-підпис `shade.exe`: потрібен code-signing сертифікат (зараз лише VERSIONINFO-метадані).
 
 ---
 
