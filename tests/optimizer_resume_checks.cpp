@@ -253,7 +253,27 @@ int main() {
         expect(p2[0].data[0] == before && opt2.t == 0, "incompatible sidecar commits nothing");
     }
 
-    // 6. An unreadable legacy sidecar (directory at that path) is not "absent".
+    // 6. P3-A: v without m is a caller bug on LOAD too (publish already rejects
+    //    it). The size check must not be hidden inside `if (!m.empty())`.
+    {
+        auto p = make_params();
+        const fs::path m_path = dir / "shade_resume_vonly_model.bin";
+        const fs::path o_path = dir / "shade_resume_vonly_opt.bin";
+        clean(m_path, o_path);
+        expect(Serialize::save_model(m_path.string(), ptrs(p), 4, 2, 16), "v-only model save");
+        std::vector<Tensor> lone_v;
+        lone_v.emplace_back(1, 2);
+        auto p2 = make_params();
+        AdamW opt2(0.05f, 0.1f);
+        for (auto* q : ptrs(p2)) opt2.add(*q);
+        const std::vector<Tensor*> no_m;
+        auto res = Serialize::CheckpointPair::load(m_path.string(), o_path.string(),
+                                                   ptrs(p2), no_m, ptrs(lone_v));
+        expect(!res.valid, "v without m rejected on load");
+        clean(m_path, o_path);
+    }
+
+    // 7. An unreadable legacy sidecar (directory at that path) is not "absent".
     {
         auto p = make_params();
         expect(Serialize::save_model(m_missing.string(), ptrs(p), 4, 2, 16), "unreadable opt model save");

@@ -314,10 +314,11 @@ inline bool read_manifest(const std::string& model_path, bool& exists, i32& gen,
     errno = 0;
     FILE* f = fopen(manifest_path(model_path).c_str(), "rb");
     if (!f) {
-        // Only a genuinely missing file may fall back to the legacy pair.
-        // EACCES and other failures must be reported as a broken manifest.
-        const int err = errno;
-        exists = (err != ENOENT && err != ENOTDIR);
+        // Only ENOENT may fall back to the legacy pair. ENOTDIR is a path
+        // configuration error (a component is a file), not an absent file.
+        // MSVC's CRT reports that case as ENOENT/EINVAL and a directory as
+        // EACCES, all of which are hard failures here as well.
+        exists = (errno != ENOENT);
         return false;
     }
     exists = true;
@@ -430,17 +431,19 @@ struct CheckpointPair {
             std::vector<Tensor> sm, sv;
             i32 t = 0;
             bool has_opt = false;
+            // P3-A: check the pair shape unconditionally. A caller passing v
+            // without m must fail even when there is no sidecar to read.
+            if (m.size() != v.size()) return bad;
             if (!m.empty()) {
-                if (m.size() != v.size()) return bad; // caller bug: never skip silently
                 errno = 0;
                 FILE* fo = fopen(opt_path.c_str(), "rb");
                 if (!fo) {
-                    const int err = errno;
-                    // Only a genuinely absent sidecar is a model-only legacy
-                    // checkpoint. EACCES and other open failures must not be
-                    // reported as "no optimizer state" — that would resume
-                    // training with zero moments and a reset step counter.
-                    if (err != ENOENT && err != ENOTDIR) return bad;
+                    // P3-B: only ENOENT means "model-only legacy checkpoint".
+                    // ENOTDIR is a broken path (file used as a directory), and
+                    // EACCES/EINVAL are broken permissions/paths — all hard
+                    // failures. Resuming with zero moments must never be the
+                    // fallback for a configuration error.
+                    if (errno != ENOENT) return bad;
                 } else {
                     // A file that exists but fails validation is a hard error.
                     // The generation path already behaves this way; legacy
