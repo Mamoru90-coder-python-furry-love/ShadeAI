@@ -24,6 +24,10 @@ struct AdamW {
         f32 ib1 = 1.0f / (1.0f - p1t);
         f32 ib2 = 1.0f / (1.0f - p2t);
         // m_hat = m*ib1, v_hat = v*ib2; decay is decoupled and never bias-corrected.
+        // CRITICAL ORDER: decay multiplies the OLD parameter p_t; the adaptive
+        // step is subtracted afterwards and must NOT be scaled by (1 - lr*wd).
+        // Applying decay to (p_t - step) shrinks the gradient step itself and is
+        // not AdamW (negative control: tests/adamw_checks.cpp).
         f32 km = lr * ib1;
         f32 kw = lr * wd;
         for (size_t i = 0; i < params.size(); i++) {
@@ -49,8 +53,8 @@ struct AdamW {
                 simd::store8(pm + j, mi);
                 simd::store8(pv + j, vi);
                 __m256 den = _mm256_add_ps(_mm256_sqrt_ps(_mm256_mul_ps(vi, ib2v)), epsv);
-                __m256 np = _mm256_sub_ps(pv_, _mm256_div_ps(_mm256_mul_ps(kmv, mi), den));
-                np = _mm256_sub_ps(np, _mm256_mul_ps(kwv, np));
+                __m256 np = _mm256_sub_ps(pv_, _mm256_mul_ps(kwv, pv_)); // decay p_t
+                np = _mm256_sub_ps(np, _mm256_div_ps(_mm256_mul_ps(kmv, mi), den));
                 simd::store8(p + j, np);
             }
 #endif
@@ -59,8 +63,9 @@ struct AdamW {
                 f32 mi = beta1 * pm[j] + (1 - beta1) * gi;
                 f32 vi = beta2 * pv[j] + (1 - beta2) * gi * gi;
                 pm[j] = mi; pv[j] = vi;
+                const f32 old_p = p[j];
+                p[j] = old_p - kw * old_p; // decay old parameter first
                 p[j] -= km * mi / (std::sqrt(vi * ib2) + eps);
-                p[j] -= kw * p[j];
             }
         }
     }

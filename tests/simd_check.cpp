@@ -155,8 +155,11 @@ int main() {
             for (i32 j = 0; j < n; j++) {
                 m[j] = b1 * m[j] + (1.0f - b1) * g.data[j];
                 v[j] = b2 * v[j] + (1.0f - b2) * g.data[j] * g.data[j];
-                f32 e = pref[j] - lr * (m[j] * ib1) / (std::sqrt(v[j] * ib2) + eps);
-                e -= lr * wd * e;
+                // True AdamW: decay the OLD parameter, then subtract the step.
+                // The previous reference decayed `e` (post-step), mirroring the
+                // production ordering bug and making this check blind to it.
+                f32 e = pref[j] - lr * wd * pref[j];
+                e -= lr * (m[j] * ib1) / (std::sqrt(v[j] * ib2) + eps);
                 pref[j] = e;
                 assert(close(p.data[j], e, 1e-4f));
             }

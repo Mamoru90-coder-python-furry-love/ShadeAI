@@ -13,6 +13,7 @@ call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
 set CFLAGS=/nologo /std:c++17 /O2 /arch:AVX /openmp /EHsc /I"%SRC%"
 
 cl %CFLAGS% "%TESTS%\simd_check.cpp" /Fe:"%OUT%simd_check.exe" || goto :fail
+cl %CFLAGS% "%TESTS%\adamw_checks.cpp" /Fe:"%OUT%adamw_checks.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\gradcheck.cpp" /Fe:"%OUT%gradcheck.exe" || goto :fail
 cl /nologo /std:c++17 /O2 /arch:AVX /EHsc /I"%SRC%" "%TESTS%\serialize_checks.cpp" /Fe:"%OUT%serialize_checks.exe" || goto :fail
 cl %CFLAGS% "%TESTS%\tokenizer_checks.cpp" /Fe:"%OUT%tokenizer_checks.exe" || goto :fail
@@ -23,6 +24,7 @@ cl /nologo /std:c++17 /O2 /arch:AVX /DNDEBUG /EHsc /I"%SRC%" "%TESTS%\tensor_che
 cl %CFLAGS% "%SRC%\main.cpp" /Fe:"%OUT%demos.exe" || goto :fail
 
 "%OUT%simd_check.exe" || goto :fail
+"%OUT%adamw_checks.exe" || goto :fail
 "%OUT%gradcheck.exe" || goto :fail
 "%OUT%serialize_checks.exe" || goto :fail
 "%OUT%tokenizer_checks.exe" || goto :fail
