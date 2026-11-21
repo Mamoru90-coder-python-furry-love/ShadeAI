@@ -199,7 +199,9 @@ int main() {
                "legacy optimizer save");
 
         const size_t sz = fs::file_size(o_legacy);
-        poke_byte(o_legacy, sz / 2, 0x42); // corrupt a float payload byte
+        // sz/2 lands in the header of the first v tensor for these shapes:
+        // this proves structural corruption is rejected, not payload corruption.
+        poke_byte(o_legacy, sz / 2, 0x42);
 
         auto p2 = make_params();
         std::vector<Tensor> g2;
@@ -254,23 +256,44 @@ int main() {
     }
 
     // 6. P3-A: v without m is a caller bug on LOAD too (publish already rejects
-    //    it). The size check must not be hidden inside `if (!m.empty())`.
+    //    it). The size check must sit at the common level of load(), before
+    //    the legacy/generation split — a model-only checkpoint must not hide it.
     {
-        auto p = make_params();
-        const fs::path m_path = dir / "shade_resume_vonly_model.bin";
-        const fs::path o_path = dir / "shade_resume_vonly_opt.bin";
-        clean(m_path, o_path);
-        expect(Serialize::save_model(m_path.string(), ptrs(p), 4, 2, 16), "v-only model save");
         std::vector<Tensor> lone_v;
         lone_v.emplace_back(1, 2);
-        auto p2 = make_params();
-        AdamW opt2(0.05f, 0.1f);
-        for (auto* q : ptrs(p2)) opt2.add(*q);
         const std::vector<Tensor*> no_m;
-        auto res = Serialize::CheckpointPair::load(m_path.string(), o_path.string(),
-                                                   ptrs(p2), no_m, ptrs(lone_v));
-        expect(!res.valid, "v without m rejected on load");
-        clean(m_path, o_path);
+
+        // 6a. legacy model-only checkpoint.
+        {
+            auto p = make_params();
+            const fs::path mp = dir / "shade_resume_vonly_model.bin";
+            const fs::path op = dir / "shade_resume_vonly_opt.bin";
+            clean(mp, op);
+            expect(Serialize::save_model(mp.string(), ptrs(p), 4, 2, 16), "v-only legacy model save");
+            auto p2 = make_params();
+            auto res = Serialize::CheckpointPair::load(mp.string(), op.string(),
+                                                       ptrs(p2), no_m, ptrs(lone_v));
+            expect(!res.valid, "v without m rejected on legacy load");
+            clean(mp, op);
+        }
+
+        // 6b. generation model-only checkpoint (manifest exists, FLAG_HAS_OPT=0).
+        //     This is the case the previous fix missed entirely.
+        {
+            auto p = make_params();
+            const fs::path mp = dir / "shade_resume_vonly_gen_model.bin";
+            const fs::path op = dir / "shade_resume_vonly_gen_opt.bin";
+            clean(mp, op);
+            const std::vector<Tensor*> none;
+            expect(Serialize::CheckpointPair::publish(mp.string(), op.string(), ptrs(p),
+                                                      4, 2, 16, none, none, 0),
+                   "publish generation model-only");
+            auto p2 = make_params();
+            auto res = Serialize::CheckpointPair::load(mp.string(), op.string(),
+                                                       ptrs(p2), no_m, ptrs(lone_v));
+            expect(!res.valid, "v without m rejected on generation model-only load");
+            clean(mp, op);
+        }
     }
 
     // 7. An unreadable legacy sidecar (directory at that path) is not "absent".

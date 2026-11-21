@@ -416,6 +416,10 @@ struct CheckpointPair {
         std::lock_guard<std::mutex> lk(pair_detail::io_mutex());
 
         const Result bad = { false, { 0, 0, 0, false }, false, 0 };
+        // Caller contract: m and v are a pair. Check it ONCE, before the
+        // legacy/generation split — a model-only checkpoint (no manifest flag
+        // and no sidecar) must not hide a v-without-m caller bug (audit 97f06b0).
+        if (m.size() != v.size()) return bad;
         bool exists = false;
         i32 gen = 0, flags = 0;
         const bool manifest_ok = pair_detail::read_manifest(model_path, exists, gen, flags);
@@ -431,9 +435,6 @@ struct CheckpointPair {
             std::vector<Tensor> sm, sv;
             i32 t = 0;
             bool has_opt = false;
-            // P3-A: check the pair shape unconditionally. A caller passing v
-            // without m must fail even when there is no sidecar to read.
-            if (m.size() != v.size()) return bad;
             if (!m.empty()) {
                 errno = 0;
                 FILE* fo = fopen(opt_path.c_str(), "rb");
@@ -476,7 +477,7 @@ struct CheckpointPair {
         std::vector<Tensor> sm, sv;
         i32 t = 0;
         if (has_opt) {
-            if (m.empty() || m.size() != v.size()) return bad;
+            if (m.empty()) return bad; // manifest promises moments, caller omitted them
             FILE* f = fopen(pair_detail::gen_path(opt_path, gen).c_str(), "rb");
             if (!f) return bad;
             const bool ok = detail::read_optimizer_blocks(f, m, v, t, sm, sv);
