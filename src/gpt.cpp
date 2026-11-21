@@ -28,6 +28,28 @@
 #include <limits>
 #include <memory>
 
+// rand()/srand() keep their state hidden inside the CRT. Wrapping every call
+// on the training path lets a v3 checkpoint store the original seed plus the
+// exact call count; resume then replays that many calls and continues with the
+// identical shuffle and sampling stream. Fresh-run behaviour is untouched.
+static constexpr i32 GPT_MAX_RAND_REPLAY = 100000000;
+static i32 g_rand_seed = 42;
+static int64_t g_rand_calls = 0;
+static int shade_rand() { ++g_rand_calls; return rand(); }
+static void shade_srand(i32 seed) {
+    g_rand_seed = seed;
+    g_rand_calls = 0;
+    srand((unsigned)seed);
+}
+// Replay from the CURRENT CRT state, not from srand(seed): layer constructors
+// also call rand() and are not counted, so the caller must shade_srand(seed)
+// BEFORE building the model and replay only after construction. That reproduces
+// seed -> construction -> training exactly, without counting every header.
+static void shade_replay_rand(i32 calls) {
+    if (calls < 0 || calls > GPT_MAX_RAND_REPLAY) return; // caller validated
+    for (i32 i = 0; i < calls; ++i) { (void)rand(); ++g_rand_calls; }
+}
+
 // Keep exactly top_k largest probabilities. Ties break by lower index, so a
 // uniform distribution cannot accidentally keep more than top_k tokens.
 inline float keep_top_k(std::vector<float>& probs, int top_k) {
@@ -153,7 +175,7 @@ struct GPT {
         }
         float filtered = keep_top_k(probs, top_k);
         if (filtered > 0) sum = filtered;
-        float r = (float)rand() / RAND_MAX;
+        float r = (float)shade_rand() / RAND_MAX;
         float cum = 0;
         for (int j = 0; j < n; j++) {
             cum += probs[j] / sum;
@@ -194,8 +216,13 @@ static constexpr i32 GPT_MAGIC = 0x53484447;
 // v2 inserts a u32 CRC-32 at offset 8; config therefore starts at offset 12.
 static constexpr i32 GPT_VERSION_V1 = 1;
 static constexpr i32 GPT_VERSION_V2 = 2;
-static constexpr i32 GPT_VERSION = GPT_VERSION_V2; // new saves
+// v3 appends a resume section after the weight blocks: training progress,
+// the exact RNG position, and the AdamW moments. v1/v2 remain readable.
+static constexpr i32 GPT_VERSION_V3 = 3;
 static constexpr size_t GPT_CRC_OFFSET = 8;
+// v3 stages two extra copies of the parameters (m and v) on load. Keep the
+// hostile-file allocation bounded before anything is read into RAM.
+static constexpr int64_t GPT_MAX_RESUME_ELEMS = 200000000; // 3 * params, floats
 // 50M floats = 200 MB. A hostile config must be rejected before any GPT object
 // is built. Weights, gradients and Dense transpose caches all count.
 static constexpr int64_t GPT_MAX_MODEL_ELEMS = 50000000;
@@ -209,6 +236,17 @@ static constexpr int64_t GPT_MAX_ACTIVATION_ELEMS = 20000000;
 
 struct GPTConfig { i32 vocab, dim, blocks, max_len; };
 struct ExpectedTensor { i32 rows, cols; };
+
+// Resume payload appended after the v3 weight blocks. One file, one CRC, one
+// atomic replace: a partial resume state can never reach a live model.
+struct GPTResume {
+    i32 epoch = 0;        // next epoch to run
+    i32 rand_seed = 42;   // seed originally passed to shade_srand()
+    i32 rand_calls = 0;   // shade_rand() calls consumed so far
+    bool has_opt = false;
+    i32 t = 0;
+    std::vector<Tensor> m, v;
+};
 
 // Derive the exact parameter layout of GPT::params() from the config alone.
 // Order: embed.w, output.w, output.b, then 12 tensors per TransformerBlock.
@@ -423,7 +461,8 @@ static bool gpt_compute_file_crc(FILE* f, uint32_t& out) {
     return true;
 }
 
-bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
+bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
+              const GPTResume* resume = nullptr) {
     using namespace Serialize::detail;
     // Write to a sibling temp file first. The previous good checkpoint stays
     // untouched until the whole file, INCLUDING its checksum, is on disk and
@@ -437,7 +476,8 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     auto wi = [&](i32 v) { if (ok) ok = write_i32(f, v); };
 
     wi(GPT_MAGIC);
-    wi(GPT_VERSION);
+    // Without an explicit resume payload, keep writing the legacy v2 layout.
+    wi(resume ? GPT_VERSION_V3 : GPT_VERSION_V2);
     if (ok) ok = gpt_write_u32(f, 0); // checksum placeholder, patched below
     wi(gpt.vocab_size);
     wi(gpt.dim);
@@ -450,6 +490,39 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
     for (auto* p : params) {
         if (!ok) break;
         ok = write_tensor(f, *p);
+    }
+
+    // v3 resume section — validate before writing so a bad payload is never
+    // published, and so the CRC always covers the exact bytes we intend.
+    if (resume && ok) {
+        if (resume->epoch < 0 || resume->rand_seed < 0 ||
+            resume->rand_calls < 0 || resume->rand_calls > GPT_MAX_RAND_REPLAY)
+            ok = false;
+        if (resume->has_opt) {
+            if (resume->m.size() != params.size() || resume->v.size() != params.size())
+                ok = false;
+            for (size_t i = 0; ok && i < params.size(); ++i) {
+                if (resume->m[i].rows != params[i]->rows ||
+                    resume->m[i].cols != params[i]->cols ||
+                    resume->v[i].rows != params[i]->rows ||
+                    resume->v[i].cols != params[i]->cols ||
+                    Serialize::has_naninf_tensor(resume->m[i]) ||
+                    Serialize::has_naninf_tensor(resume->v[i]))
+                    ok = false;
+            }
+        }
+    }
+    if (resume && ok) {
+        wi(resume->epoch);
+        wi(resume->rand_seed);
+        wi(resume->rand_calls);
+        wi(resume->has_opt ? 1 : 0);
+        if (resume->has_opt) {
+            wi((i32)resume->m.size());
+            for (const auto& mt : resume->m) { if (!ok) break; ok = write_tensor(f, mt); }
+            for (const auto& vt : resume->v) { if (!ok) break; ok = write_tensor(f, vt); }
+            wi(resume->t);
+        }
     }
 
     if (ok) {
@@ -468,7 +541,8 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok) {
 
 bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                          Tokenizer& tok, std::vector<Tensor>& weights,
-                         size_t max_tokenizer_bytes = Tokenizer::MAX_BYTES) {
+                         size_t max_tokenizer_bytes = Tokenizer::MAX_BYTES,
+                         GPTResume* resume = nullptr) {
     using namespace Serialize::detail;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -477,17 +551,22 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
     GPTConfig parsed{};
     Tokenizer parsed_tok;
     std::vector<Tensor> staged;
+    GPTResume parsed_resume;
     bool ok = false;
     do {
         // 1-4: open, header, version.
         i32 magic, ver;
         if (!read_i32(f, magic) || !read_i32(f, ver)) break;
         if (magic != GPT_MAGIC) break;
-        if (ver != GPT_VERSION_V1 && ver != GPT_VERSION_V2) break;
+        if (ver < GPT_VERSION_V1 || ver > GPT_VERSION_V3) break;
+        // An explicit resume must never silently degrade to a weights-only
+        // load: v1/v2 carry no progress or moments. Inference (resume == nullptr)
+        // keeps reading every historical version.
+        if (resume && ver < GPT_VERSION_V3) break;
 
-        // 5-6: v2 verifies the checksum BEFORE any payload is parsed. v1 has
+        // 5-6: v2+ verifies the checksum BEFORE any payload is parsed. v1 has
         // no checksum field and keeps its original layout (config at offset 8).
-        if (ver == GPT_VERSION_V2) {
+        if (ver >= GPT_VERSION_V2) {
             uint32_t stored_crc = 0, computed_crc = 0;
             if (!gpt_read_u32(f, stored_crc)) break;
             if (!gpt_compute_file_crc(f, computed_crc) || computed_crc != stored_crc) break;
@@ -523,60 +602,187 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
             total_elems += (int64_t)t.rows * t.cols;
             staged.push_back(std::move(t));
         }
-        // 8: whole-file validation (no truncation and no trailing bytes).
+        // 8: v3 resume section. Staged into parsed_resume; NOTHING is assigned
+        // to caller-owned state until the whole file (including CRC) passes.
+        if (ver == GPT_VERSION_V3) {
+            auto read_resume = [&]() -> bool {
+                i32 epoch = 0, seed = 0, calls = 0, has_opt = 0;
+                if (!read_i32(f, epoch) || !read_i32(f, seed) ||
+                    !read_i32(f, calls) || !read_i32(f, has_opt)) return false;
+                if (epoch < 0 || seed < 0 || calls < 0 ||
+                    calls > GPT_MAX_RAND_REPLAY || (has_opt != 0 && has_opt != 1))
+                    return false;
+                parsed_resume.epoch = epoch;
+                parsed_resume.rand_seed = seed;
+                parsed_resume.rand_calls = calls;
+                parsed_resume.has_opt = has_opt != 0;
+                if (!has_opt) return true;
+
+                i32 n = 0;
+                if (!read_i32(f, n) || n != (i32)expected.size()) return false;
+                if (expected_params > GPT_MAX_RESUME_ELEMS / 3) return false;
+                int64_t used = 0;
+                parsed_resume.m.reserve(expected.size());
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    Tensor t;
+                    const size_t remaining = (size_t)(expected_params - used);
+                    if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
+                        return false;
+                    used += (int64_t)t.rows * t.cols;
+                    parsed_resume.m.push_back(std::move(t));
+                }
+                if ((i32)parsed_resume.m.size() != n || used != expected_params) return false;
+                used = 0;
+                parsed_resume.v.reserve(expected.size());
+                for (size_t i = 0; i < expected.size(); ++i) {
+                    Tensor t;
+                    const size_t remaining = (size_t)(expected_params - used);
+                    if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
+                        return false;
+                    used += (int64_t)t.rows * t.cols;
+                    parsed_resume.v.push_back(std::move(t));
+                }
+                if ((i32)parsed_resume.v.size() != n || used != expected_params) return false;
+                i32 rt = 0;
+                if (!read_i32(f, rt) || rt < 0) return false;
+                parsed_resume.t = rt;
+                for (const auto& t : parsed_resume.m)
+                    if (Serialize::has_naninf_tensor(t)) return false;
+                for (const auto& t : parsed_resume.v)
+                    if (Serialize::has_naninf_tensor(t)) return false;
+                return true;
+            };
+            if (!read_resume()) break;
+        }
+
+        // 9: whole-file validation (no truncation and no trailing bytes).
         if (staged.size() != expected.size() || total_elems != expected_params
             || !at_eof(f)) break;
         ok = true;
     } while (false);
     fclose(f);
 
-    // 9: commit only after every stage passed.
+    // 10: commit only after every stage passed.
     if (!ok) return false;
     cfg = parsed;
     tok = std::move(parsed_tok);
     weights = std::move(staged);
+    if (resume) *resume = std::move(parsed_resume);
     return true;
 }
 
-void train_gpt(const std::string& data_path, const std::string& model_path) {
-    printf("=== GPT-2 Mini ===\n");
-    srand(42);
+// Knobs are explicit so the resume harness can train a tiny model in seconds.
+// Defaults reproduce the original production run exactly.
+struct GPTTrainConfig {
+    i32 dim = 64;
+    i32 blocks = 3;
+    i32 max_len = 32;
+    i32 epochs = 12;
+    i32 batch_size = 8;
+    size_t max_chars = 100000;
+    bool verbose = true;
+};
+
+void train_gpt(const std::string& data_path, const std::string& model_path,
+               bool do_resume = false, const GPTTrainConfig& tcfg = {}) {
+    if (tcfg.verbose) {
+        printf("=== GPT-2 Mini ===\n");
+        if (do_resume) printf("  resuming from %s\n", model_path.c_str());
+    }
     setbuf(stdout, NULL);
 
-    // Load text
+    GPTConfig cfg{};
+    Tokenizer tok;
+    std::vector<Tensor> weights;
+    GPTResume resumed;
+    bool have_resume = false;
+
+    if (do_resume) {
+        // Staged inside read_gpt_checkpoint: a corrupt resume section cannot
+        // alter weights, tokenizer or moments before the whole file validates.
+        if (!read_gpt_checkpoint(model_path, cfg, tok, weights,
+                                 Tokenizer::MAX_BYTES, &resumed)) {
+            printf("ERROR: cannot resume from %s (missing, corrupt, or not a v3 checkpoint).\n",
+                   model_path.c_str());
+            return;
+        }
+        have_resume = true;
+        // Seed BEFORE constructing the model: layer constructors consume rand()
+        // too, and the replay below must continue from that same position.
+        shade_srand(resumed.rand_seed);
+    } else {
+        shade_srand(42);
+    }
+
+    // Text is still needed for training tokens; on resume the tokenizer and
+    // architecture come from the checkpoint, never from a freshly built one.
     std::ifstream file(data_path);
     if (!file.is_open()) { printf("ERROR: can't open %s\n", data_path.c_str()); return; }
     std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
+    if (text.size() > tcfg.max_chars) text = text.substr(0, tcfg.max_chars);
+    if (tcfg.verbose) printf("  loaded %d chars (%.1fKB)\n", (int)text.size(), text.size() / 1000.0f);
 
-    // Use first 100KB for speed
-    if (text.size() > 100000) text = text.substr(0, 100000);
-    printf("  loaded %d chars (%.1fKB)\n", (int)text.size(), text.size() / 1000.0f);
+    if (!have_resume) {
+        tok.build(text, 2000);
+        cfg = { tok.vocab_size, tcfg.dim, tcfg.blocks, tcfg.max_len };
+    } else if ((i32)tok.vocab_size != cfg.vocab) {
+        printf("ERROR: restored tokenizer vocab %d != checkpoint vocab %d\n",
+               tok.vocab_size, cfg.vocab);
+        return;
+    }
+    if (tcfg.verbose) printf("  vocab: %d tokens\n", tok.vocab_size);
 
-    // Build tokenizer
-    Tokenizer tok;
-    tok.build(text, 2000);
-    printf("  vocab: %d tokens\n", tok.vocab_size);
-
-    // Encode entire dataset
     auto data = tok.encode(text);
-    printf("  encoded: %d tokens\n", (int)data.size());
+    if (tcfg.verbose) printf("  encoded: %d tokens\n", (int)data.size());
 
-    // Model config
-    int dim = 64, num_blocks = 3, max_len = 32;
-    GPT gpt(tok.vocab_size, dim, num_blocks, max_len);
+    GPT gpt(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
     AdamW opt(0.001f, 0.0f);
-    for (auto* p : gpt.params()) opt.add(*p);
+    auto params = gpt.params();
+    for (auto* p : params) opt.add(*p);
+
+    if (have_resume) {
+        if (weights.size() != params.size() ||
+            resumed.m.size() != params.size() || resumed.v.size() != params.size()) {
+            printf("ERROR: resume tensor count mismatch\n");
+            return;
+        }
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (weights[i].rows != params[i]->rows || weights[i].cols != params[i]->cols ||
+                resumed.m[i].rows != params[i]->rows || resumed.m[i].cols != params[i]->cols ||
+                resumed.v[i].rows != params[i]->rows || resumed.v[i].cols != params[i]->cols) {
+                printf("ERROR: resume tensor shape mismatch at %zu\n", i);
+                return;
+            }
+        }
+        for (size_t i = 0; i < params.size(); ++i) {
+            params[i]->data = std::move(weights[i].data);
+            opt.m[i].data = std::move(resumed.m[i].data);
+            opt.v[i].data = std::move(resumed.v[i].data);
+        }
+        opt.t = resumed.t;
+        shade_replay_rand(resumed.rand_calls);
+    }
 
     int total_params = 0;
-    for (auto* p : gpt.params()) total_params += p->size();
-    printf("  model: %d params, %d blocks, dim=%d, ctx=%d\n",
-           total_params, num_blocks, dim, max_len);
+    for (auto* p : params) total_params += p->size();
+    if (tcfg.verbose)
+        printf("  model: %d params, %d blocks, dim=%d, ctx=%d\n",
+               total_params, cfg.blocks, cfg.dim, cfg.max_len);
 
-    int seq_len = max_len, epochs = 12, batch_size = 8;
+    int seq_len = cfg.max_len;
+    int start_epoch = have_resume ? resumed.epoch : 0;
+    if (start_epoch < 0 || start_epoch > tcfg.epochs) {
+        printf("ERROR: checkpoint epoch %d outside [0, %d]\n", start_epoch, tcfg.epochs);
+        return;
+    }
+    if (start_epoch == tcfg.epochs) {
+        if (tcfg.verbose) printf("  training already complete (epoch %d)\n", start_epoch);
+        return;
+    }
     int iters_since_step = 0;
 
-    for (int ep = 0; ep < epochs; ep++) {
+    for (int ep = start_epoch; ep < tcfg.epochs; ep++) {
         auto pp = gpt.params();
         auto gp = gpt.grads();
         opt.zero_grad(gp);
@@ -598,7 +804,7 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
         for (size_t i = 0; i + seq_len + 1 < data.size(); i += seq_len / 2)
             indices.push_back((int)i);
         for (int i = (int)indices.size() - 1; i > 0; i--)
-            std::swap(indices[i], indices[rand() % (i + 1)]);
+            std::swap(indices[i], indices[shade_rand() % (i + 1)]);
 
         for (int idx : indices) {
             Tensor ids(1, seq_len);
@@ -615,34 +821,53 @@ void train_gpt(const std::string& data_path, const std::string& model_path) {
             iters++;
             iters_since_step++;
 
-            if (iters_since_step >= batch_size) finish_step();
+            if (iters_since_step >= tcfg.batch_size) finish_step();
         }
         if (iters_since_step > 0) finish_step();
 
         double t1 = clock();
         float avg_loss = tl / fmaxf(1, iters);
 
-        // Generate sample
+        // Generate sample — this also consumes rand(), so its call count is
+        // part of the resume state captured by the checkpoint below.
         std::vector<int> seed = {Tokenizer::BOS};
         std::string gen = gpt.generate(seed, 40, 0.8f, 20, tok);
-        printf("  ep %2d loss=%.4f [%.0fs] | %s\n",
-               ep, avg_loss, (t1 - t0) / CLOCKS_PER_SEC, gen.c_str());
-        fflush(stdout);
+        if (tcfg.verbose) {
+            printf("  ep %2d loss=%.4f [%.0fs] | %s\n",
+                   ep, avg_loss, (t1 - t0) / CLOCKS_PER_SEC, gen.c_str());
+            fflush(stdout);
+        }
+
+        // Checkpoint every epoch, not just after the last one. An interrupted
+        // run therefore has a usable recovery point. save_gpt writes a sibling
+        // temp then atomically replaces, so a crash leaves the last good file.
+        GPTResume out;
+        out.epoch = ep + 1;
+        out.rand_seed = g_rand_seed;
+        out.rand_calls = (i32)g_rand_calls;
+        out.has_opt = true;
+        out.t = opt.t;
+        out.m.reserve(opt.m.size());
+        out.v.reserve(opt.v.size());
+        for (const auto& mt : opt.m) out.m.emplace_back(mt.rows, mt.cols, mt.data);
+        for (const auto& vt : opt.v) out.v.emplace_back(vt.rows, vt.cols, vt.data);
+        if (!save_gpt(model_path, gpt, tok, &out)) {
+            printf("  ERROR: failed to save model to %s\n", model_path.c_str());
+            return;
+        }
+        if (tcfg.verbose)
+            printf("  checkpoint: epoch=%d t=%d rand_calls=%d\n",
+                   out.epoch, out.t, out.rand_calls);
     }
 
-    // Save a self-contained checkpoint (config + tokenizer + weights).
-    if (!save_gpt(model_path, gpt, tok)) {
-        printf("  ERROR: failed to save model to %s\n", model_path.c_str());
-        return;
-    }
-    printf("  model saved to %s\n", model_path.c_str());
-
-    printf("\n  --- final generation ---\n");
-    const char* prompts[] = {"once upon a time", "the robot", "hello", nullptr};
-    for (int i = 0; prompts[i]; i++) {
-        auto ids = tok.encode(prompts[i]);
-        std::string gen = gpt.generate(ids, 80, 0.7f, 20, tok);
-        printf("  \"%s\" -> %s\n", prompts[i], gen.c_str());
+    if (tcfg.verbose) {
+        printf("\n  --- final generation ---\n");
+        const char* prompts[] = {"once upon a time", "the robot", "hello", nullptr};
+        for (int i = 0; prompts[i]; i++) {
+            auto ids = tok.encode(prompts[i]);
+            std::string gen = gpt.generate(ids, 80, 0.7f, 20, tok);
+            printf("  \"%s\" -> %s\n", prompts[i], gen.c_str());
+        }
     }
 }
 
@@ -695,13 +920,20 @@ int main(int argc, char** argv) {
     std::string model_path = "gpt_model.bin";
     std::string prompt;
     bool train = true;
+    bool resume = false;
     bool load_seen = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--train") {
             train = true;
+            resume = false;
             if (i + 1 < argc && argv[i + 1][0] != '-') data_path = argv[++i];
+            if (i + 1 < argc && argv[i + 1][0] != '-') model_path = argv[++i];
+        } else if (a == "--resume" || a == "--continue") {
+            // Both spellings are accepted: older launch scripts use --continue.
+            train = true;
+            resume = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') model_path = argv[++i];
         } else if (a == "--load") {
             train = false;
@@ -718,13 +950,14 @@ int main(int argc, char** argv) {
         } else {
             printf("Unknown argument: %s\n"
                    "Usage: shade.exe [--train [data.txt] [model.bin] |\n"
+                   "                  --resume|--continue [model.bin] |\n"
                    "                  --load <model.bin> [--prompt] \"text\"]\n", a.c_str());
             return 1;
         }
     }
 
     if (train) {
-        train_gpt(data_path, model_path);
+        train_gpt(data_path, model_path, resume);
     } else {
         infer_gpt(model_path, prompt);
     }
