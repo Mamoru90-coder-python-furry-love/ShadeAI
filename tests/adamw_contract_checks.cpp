@@ -137,6 +137,16 @@ int main() {
             { filled(1, 8, 0.0f) }, v);
     }
 
+    std::puts("[size_t -> i32 guard before step]");
+    {
+        const size_t max_i32 = static_cast<size_t>(std::numeric_limits<i32>::max());
+        const bool guarded = fits_i32(max_i32) && !fits_i32(max_i32 + 1) &&
+                             !fits_i32(std::numeric_limits<size_t>::max());
+        std::printf("  %-38s %s\n", "oversized element count rejected",
+                    guarded ? "OK" : "FAIL");
+        if (!guarded) ok = false;
+    }
+
     std::puts("[control: well-formed call must still update]");
     {
         std::vector<Tensor> p{ filled(1, 8, 1.0f) }, g{ filled(1, 8, 1.0f) };

@@ -62,6 +62,15 @@ static inline i32 checked_size(i32 r, i32 c) {
         throw std::length_error("Tensor: rows * cols overflows i32");
     return r * c;
 }
+static inline bool fits_i32(size_t n) {
+    return n <= static_cast<size_t>(std::numeric_limits<i32>::max());
+}
+// data is public: callers can resize it without changing rows/cols. Refuse to
+// wrap a size_t count into the i32 used by every element loop.
+static inline i32 checked_data_size(size_t n) {
+    if (!fits_i32(n)) throw std::length_error("Tensor: data.size() exceeds i32");
+    return static_cast<i32>(n);
+}
 
 struct Tensor {
     i32 rows, cols;
@@ -87,7 +96,7 @@ struct Tensor {
     }
     f32& at(i32 r, i32 c) { check_bounds(r, c); return data[r * cols + c]; }
     f32  at(i32 r, i32 c) const { check_bounds(r, c); return data[r * cols + c]; }
-    i32 size() const { return (i32)data.size(); }
+    i32 size() const { return checked_data_size(data.size()); }
 
     void fill(f32 v) { std::fill(data.begin(), data.end(), v); }
     Tensor clone() const { return Tensor(rows, cols, data); }

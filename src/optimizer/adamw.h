@@ -41,6 +41,7 @@ struct AdamW {
             if (!data_matches_shape(*p) || !data_matches_shape(*g) ||
                 !data_matches_shape(m[i]) || !data_matches_shape(v[i])) return;
             const size_t want = p->data.size();
+            if (!fits_i32(want)) return; // element loops use i32; reject before t++
             if (g->data.size() != want || m[i].data.size() != want ||
                 v[i].data.size() != want) return;
         }

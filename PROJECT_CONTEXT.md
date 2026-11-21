@@ -376,7 +376,7 @@ v data.size() 12 vs 8        FAIL (t 0->1)
 
 Негативний контроль на невиправленому коді: `shade.exe --resume <model.bin> hello` → `Unknown argument: --resume`, exit=1. `train_gpt` завжди починав з `ep=0`, `opt.t=0`, `srand(42)` і зберігав лише SHDG v2 (ваги + конфіг + токенайзер). `Serialize::CheckpointPair` не можна перевикористати напряму: він пише **SHDE** через `save_model()`, а GPT — **SHDG** з власним CRC і токенайзером. Механізм `CheckpointPair` не змінювався.
 
-**P3 (зафіксовано, не фіксувалося):** `Tensor::size()` = `(i32)data.size()` (`src/core/tensor.h:90`). Перевірка `data.size() == rows*cols` у `AdamW::step` не обмежує розмір значенням `INT32_MAX`; вручну розширений `data` > 2^31 елементів все ще може дати хибне `n` у ядрі.
+**P3 (було зафіксовано, пізніше виправлено в audit `d8ca469`):** `Tensor::size()` = `(i32)data.size()` (`src/core/tensor.h:90`). Перевірка `data.size() == rows*cols` у `AdamW::step` не обмежує розмір значенням `INT32_MAX`; вручну розширений `data` > 2^31 елементів все ще може дати хибне `n` у ядрі.
 
 **Обраний формат — SHDG v3, один файл.** Після блоків ваг додається секція resume: `epoch, rand_seed, rand_calls, has_opt` і, за наявності, `n`, блоки `m`, блоки `v`, `t`. Новий запис без resume-об'єкта й досі пише v2. Читання v1/v2 для inference збережено; явний resume v1/v2 відхиляє (не перетворюється тихо на «свіжий старт»). CRC v2/v3 покриває й нову секцію.
 
@@ -410,6 +410,19 @@ v data.size() 12 vs 8        FAIL (t 0->1)
 `tests\gpt_resume_checks.cpp` розширено: CLI exit-коди, `--model`/`--data`/шляхи з пробілами, завершений чекпойнт без датасету, зміна датасету, зміна ліміту епох, архітектурний override і межа `rand_calls`.
 
 Верифікація після фіксу: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E на `build\shade.exe`: train `exit=0`, inference v3 `exit=0`, inference v1-фікстури `exit=0`, resume завершеного чекпойнта `exit=0`, а відсутній/пошкоджений/v1-як-resume `exit=1`.
+
+#### Аудит `INT32_MAX` у `Tensor::size()` / `AdamW` (база `d8ca469`)
+
+Негативний контроль на невиправленому коді: `(size_t)INT32_MAX + 1` у виразі `(i32)data.size()` дає `-2147483648`; отже всі цикли `for (i32 i = 0; i < size(); i++)` просто не виконуються замість відмови. `AdamW::step` перевіряв `data.size() == rows*cols` у `size_t`, але не мав явної межі `INT32_MAX`, тож міг дійти до ядра з хибним `n` і вже після `t++`.
+
+Виправлення без зміни математики:
+
+- `src/core/tensor.h`: додано `fits_i32(size_t)` і `checked_data_size(size_t)`; `Tensor::size()` тепер кидає `std::length_error` замість тихого переповнення.
+- `src\optimizer\adamw.h`: у передмутаційній перевірці додано `if (!fits_i32(want)) return;` — ще до `t++` і до будь-якої зміни параметрів/моментів.
+
+Конструктори вже мали `checked_size()`, тож шлях з валідної форми лишається незмінним. Новий захист критичний саме для публічного `data`, який можна `resize()` без зміни `rows/cols`.
+
+Тести: `tensor_checks` перевіряє межі `INT32_MAX`, `INT32_MAX+1`, `SIZE_MAX`, кидок для надмірного count і незмінність звичайного `size()`; `adamw_contract_checks` додає окремий guard-кейс. Реального виділення >2^31 елементів (8 ГБ) не робилось — перевіряється саме перетворення лічильника. Мутаційний контроль: тимчасовий `fits_i32() → true` дає `tensor_checks: FAILED`; після відновлення — `OK`.
 
 ### Ще не зроблено
 
