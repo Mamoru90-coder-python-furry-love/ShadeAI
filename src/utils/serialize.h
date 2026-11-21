@@ -112,6 +112,52 @@ inline void commit(std::vector<Tensor>& staged, const std::vector<Tensor*>& para
     for (size_t i = 0; i < params.size(); i++) params[i]->data = std::move(staged[i].data);
 }
 
+// Staged readers: validate the whole file and return tensors in `staged`.
+// Nothing is written to live tensors until the caller commits (so a paired
+// loader can commit model + optimizer together).
+inline bool read_model_blocks(FILE* f, const std::vector<Tensor*>& params,
+                              i32& dim, i32& blocks, i32& ctx, std::vector<Tensor>& staged) {
+    i32 header[4];
+    if (!read_exact(f, header, sizeof(header)) || header[0] != 0x53484445) return false;
+    if (header[1] <= 0 || header[2] <= 0 || header[3] <= 0) return false;
+    i32 n;
+    if (!read_i32(f, n) || n < 0 || n != (i32)params.size()) return false;
+    staged.clear();
+    staged.reserve(n);
+    for (i32 i = 0; i < n; i++) {
+        Tensor t;
+        if (!read_tensor(f, t, params[i]->rows, params[i]->cols)) return false;
+        staged.push_back(std::move(t));
+    }
+    if ((i32)staged.size() != n || !at_eof(f)) return false;
+    dim = header[1]; blocks = header[2]; ctx = header[3];
+    return true;
+}
+
+inline bool read_optimizer_blocks(FILE* f, const std::vector<Tensor*>& m,
+                                  const std::vector<Tensor*>& v, i32& t,
+                                  std::vector<Tensor>& sm, std::vector<Tensor>& sv) {
+    if (m.size() != v.size()) return false;
+    i32 n;
+    if (!read_i32(f, n) || n < 0 || n != (i32)m.size()) return false;
+    sm.clear(); sv.clear();
+    sm.reserve(n); sv.reserve(n);
+    for (i32 i = 0; i < n; i++) {
+        Tensor x;
+        if (!read_tensor(f, x, m[i]->rows, m[i]->cols)) return false;
+        sm.push_back(std::move(x));
+    }
+    for (i32 i = 0; i < n; i++) {
+        Tensor x;
+        if (!read_tensor(f, x, v[i]->rows, v[i]->cols)) return false;
+        sv.push_back(std::move(x));
+    }
+    i32 new_t;
+    if (!read_i32(f, new_t) || new_t < 0 || !at_eof(f)) return false;
+    t = new_t;
+    return true;
+}
+
 } // namespace detail
 
 bool save(const std::string& path, const std::vector<Tensor*>& params) {
@@ -175,31 +221,13 @@ ModelInfo load_model(const std::string& path, const std::vector<Tensor*>& params
     const ModelInfo bad = { 0, 0, 0, false };
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return bad;
-
-    ModelInfo info = bad;
-    do {
-        i32 header[4];
-        if (!detail::read_exact(f, header, sizeof(header)) || header[0] != 0x53484445) break;
-        if (header[1] <= 0 || header[2] <= 0 || header[3] <= 0) break;
-
-        i32 n;
-        if (!detail::read_i32(f, n) || n < 0 || n != (i32)params.size()) break;
-
-        std::vector<Tensor> staged;
-        staged.reserve(n);
-        for (i32 i = 0; i < n; i++) {
-            Tensor t;
-            if (!detail::read_tensor(f, t, params[i]->rows, params[i]->cols)) break;
-            staged.push_back(std::move(t));
-        }
-        if ((i32)staged.size() != n || !detail::at_eof(f)) break;
-
-        detail::commit(staged, params);
-        info = { header[1], header[2], header[3], true };
-    } while (false);
-
+    std::vector<Tensor> staged;
+    i32 d = 0, b = 0, c = 0;
+    const bool ok = detail::read_model_blocks(f, params, d, b, c, staged);
     fclose(f);
-    return info;
+    if (!ok) return bad;
+    detail::commit(staged, params);
+    return { d, b, c, true };
 }
 
 ModelInfo read_model_info(const std::string& path) {
@@ -240,45 +268,186 @@ bool load_optimizer(const std::string& path,
     if (m.size() != v.size()) return false;
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
-
-    bool ok = false;
-    do {
-        i32 n;
-        if (!detail::read_i32(f, n) || n < 0 || n != (i32)m.size()) break;
-
-        std::vector<Tensor> sm, sv;
-        sm.reserve(n); sv.reserve(n);
-        bool blocks_ok = true;
-        for (i32 i = 0; i < n && blocks_ok; i++) {
-            Tensor tmp;
-            blocks_ok = detail::read_tensor(f, tmp, m[i]->rows, m[i]->cols);
-            if (blocks_ok) sm.push_back(std::move(tmp));
-        }
-        for (i32 i = 0; i < n && blocks_ok; i++) {
-            Tensor tmp;
-            blocks_ok = detail::read_tensor(f, tmp, v[i]->rows, v[i]->cols);
-            if (blocks_ok) sv.push_back(std::move(tmp));
-        }
-        if (!blocks_ok) break;
-
-        i32 new_t;
-        if (!detail::read_i32(f, new_t) || new_t < 0 || !detail::at_eof(f)) break;
-
-        detail::commit(sm, m);
-        detail::commit(sv, v);
-        t = new_t;
-        ok = true;
-    } while (false);
-
+    std::vector<Tensor> sm, sv;
+    i32 new_t = 0;
+    const bool ok = detail::read_optimizer_blocks(f, m, v, new_t, sm, sv);
     fclose(f);
-    return ok;
+    if (!ok) return false;
+    detail::commit(sm, m);
+    detail::commit(sv, v);
+    t = new_t;
+    return true;
 }
 
+// ---- Paired checkpoint publishing (model + AdamW state as one generation) ----
+// Two separately atomic files are not enough: a crash, or a failed optimizer
+// write after a successful model write, leaves a new model beside an old
+// optimizer — and both load_* calls succeed on that mix. Both snapshots are
+// therefore written under a generation number and one small manifest is
+// atomically replaced LAST. A reader sees either the old pair or the new pair,
+// never a mix. Legacy plain files remain readable when no manifest exists.
+namespace pair_detail {
+
+static constexpr i32 MANIFEST_MAGIC = 0x52494150; // "PAIR" on disk (little-endian)
+static constexpr i32 FLAG_HAS_OPT = 1;
+
+inline std::string gen_path(const std::string& base, i32 gen) {
+    return base + ".g" + std::to_string(gen);
+}
+inline std::string manifest_path(const std::string& model_path) {
+    return model_path + ".manifest";
+}
+
+// `exists` separates "no manifest yet" (legacy fallback) from "manifest
+// present but corrupt" (hard failure). gen/flags are only set on success.
+inline bool read_manifest(const std::string& model_path, bool& exists, i32& gen, i32& flags) {
+    FILE* f = fopen(manifest_path(model_path).c_str(), "rb");
+    if (!f) { exists = false; return false; }
+    exists = true;
+    i32 h[3];
+    const bool ok = detail::read_exact(f, h, sizeof(h)) && detail::at_eof(f);
+    fclose(f);
+    // Bound gen so a corrupt manifest cannot overflow gen+1 or drive the
+    // garbage-collection loop over billions of missing files.
+    if (!ok || h[0] != MANIFEST_MAGIC || h[1] <= 0 || h[1] > 1000000 ||
+        (h[2] & ~FLAG_HAS_OPT) != 0)
+        return false;
+    gen = h[1]; flags = h[2];
+    return true;
+}
+
+inline bool write_manifest(const std::string& model_path, i32 gen, i32 flags) {
+    return detail::write_atomic(manifest_path(model_path), [&](FILE* f) {
+        const i32 h[3] = { MANIFEST_MAGIC, gen, flags };
+        return detail::write_exact(f, h, sizeof(h));
+    });
+}
+
+} // namespace pair_detail
+
+struct CheckpointPair {
+    struct Result {
+        bool valid;
+        ModelInfo info;
+        bool has_opt;
+        i32 t;
+    };
+
+    // Publish model + optimizer as one generation. Any failure before the
+    // manifest replace leaves readers on the previous generation.
+    static bool publish(const std::string& model_path, const std::string& opt_path,
+                        const std::vector<Tensor*>& params, i32 dim, i32 blocks, i32 ctx,
+                        const std::vector<Tensor*>& m, const std::vector<Tensor*>& v, i32 t) {
+        bool exists = false;
+        i32 prev = 0, prev_flags = 0;
+        if (pair_detail::read_manifest(model_path, exists, prev, prev_flags)) {
+            // advance from the current generation
+        } else if (exists) {
+            return false; // corrupt manifest: never silently restart at g1
+        }
+        const i32 gen = prev + 1;
+        const bool has_opt = !m.empty();
+        if (has_opt && (m.size() != v.size() || t < 0)) return false;
+
+        const std::string mg = pair_detail::gen_path(model_path, gen);
+        const std::string og = pair_detail::gen_path(opt_path, gen);
+        if (!save_model(mg, params, dim, blocks, ctx)) return false;
+        if (has_opt && !save_optimizer(og, m, v, t)) return false;
+
+        // Verify the staged files before advertising them. write_atomic already
+        // checked the write itself; this also catches a bad shape/config.
+        const ModelInfo vi = read_model_info(mg);
+        if (!vi.valid || vi.dim != dim || vi.blocks != blocks || vi.ctx != ctx) return false;
+        if (has_opt) {
+            std::vector<Tensor> tm, tv;
+            std::vector<Tensor*> pm, pv;
+            tm.reserve(m.size()); tv.reserve(v.size());
+            for (auto* p : m) { tm.emplace_back(p->rows, p->cols); pm.push_back(&tm.back()); }
+            for (auto* p : v) { tv.emplace_back(p->rows, p->cols); pv.push_back(&tv.back()); }
+            i32 vt = -1;
+            if (!load_optimizer(og, pm, pv, vt) || vt != t) return false;
+        }
+
+        if (!pair_detail::write_manifest(model_path, gen,
+                                         has_opt ? pair_detail::FLAG_HAS_OPT : 0))
+            return false;
+
+        // Keep two newest generations: a reader may still hold the old manifest.
+        for (i32 g = 1; g <= gen - 2; g++) {
+            std::remove(pair_detail::gen_path(model_path, g).c_str());
+            std::remove(pair_detail::gen_path(opt_path, g).c_str());
+        }
+        return true;
+    }
+
+    // Load the generation named by the manifest. Both files are staged before
+    // either is committed, so a corrupt pair cannot half-update live tensors.
+    static Result load(const std::string& model_path, const std::string& opt_path,
+                       const std::vector<Tensor*>& params,
+                       const std::vector<Tensor*>& m, const std::vector<Tensor*>& v) {
+        const Result bad = { false, { 0, 0, 0, false }, false, 0 };
+        bool exists = false;
+        i32 gen = 0, flags = 0;
+        const bool manifest_ok = pair_detail::read_manifest(model_path, exists, gen, flags);
+
+        if (!exists) { // legacy pair: plain files, no generation stamp
+            FILE* f = fopen(model_path.c_str(), "rb");
+            if (!f) return bad;
+            std::vector<Tensor> sp;
+            i32 d = 0, b = 0, c = 0;
+            const bool ok = detail::read_model_blocks(f, params, d, b, c, sp);
+            fclose(f);
+            if (!ok) return bad;
+            std::vector<Tensor> sm, sv;
+            i32 t = 0;
+            bool has_opt = false;
+            if (!m.empty()) {
+                FILE* fo = fopen(opt_path.c_str(), "rb");
+                if (fo) {
+                    has_opt = detail::read_optimizer_blocks(fo, m, v, t, sm, sv);
+                    fclose(fo);
+                }
+            }
+            detail::commit(sp, params);
+            if (has_opt) { detail::commit(sm, m); detail::commit(sv, v); }
+            return { true, { d, b, c, true }, has_opt, t };
+        }
+        if (!manifest_ok) return bad; // present but corrupt
+
+        std::vector<Tensor> sp;
+        i32 d = 0, b = 0, c = 0;
+        {
+            FILE* f = fopen(pair_detail::gen_path(model_path, gen).c_str(), "rb");
+            if (!f) return bad;
+            const bool ok = detail::read_model_blocks(f, params, d, b, c, sp);
+            fclose(f);
+            if (!ok) return bad;
+        }
+
+        const bool has_opt = (flags & pair_detail::FLAG_HAS_OPT) != 0;
+        std::vector<Tensor> sm, sv;
+        i32 t = 0;
+        if (has_opt) {
+            if (m.empty() || m.size() != v.size()) return bad;
+            FILE* f = fopen(pair_detail::gen_path(opt_path, gen).c_str(), "rb");
+            if (!f) return bad;
+            const bool ok = detail::read_optimizer_blocks(f, m, v, t, sm, sv);
+            fclose(f);
+            if (!ok) return bad;
+        }
+
+        detail::commit(sp, params);
+        if (has_opt) { detail::commit(sm, m); detail::commit(sv, v); }
+        return { true, { d, b, c, true }, has_opt, t };
+    }
+};
+
 // ---- async (threaded) checkpoint writer ----
-// NOTE: the files written here use the legacy SHDE layout from save_model /
-// save_optimizer. They are NOT the self-contained v2 GPT checkpoint written by
-// save_gpt() (SHDG magic + version + tokenizer + CRC). Do not point these paths
-// at a GPT checkpoint unless its loader understands this format.
+// NOTE: this writes generation-stamped SHDE files via CheckpointPair, NOT the
+// self-contained v2 GPT checkpoint from save_gpt() (SHDG + version + tokenizer
+// + CRC). Do not point these paths at a GPT checkpoint. Use CheckpointPair::load
+// to read what this class publishes; plain load_model/load_optimizer still read
+// the legacy unsuffixed files.
 // Paths are configurable so callers (and tests) do not depend on a fixed ../model dir.
 struct AsyncSaver {
     struct Buf { std::vector<Tensor> model; std::vector<Tensor> m, v; i32 dim=0, blocks=0, ctx=0, t=0; };
@@ -292,6 +461,8 @@ struct AsyncSaver {
         : model_path("../model/gpt_model.bin"), opt_path("../model/gpt_opt.bin") {}
     AsyncSaver(std::string mp, std::string op)
         : model_path(std::move(mp)), opt_path(std::move(op)) {}
+    // A joinable std::thread at destruction would call std::terminate.
+    ~AsyncSaver() { flush(); }
 
     void queue_model(const std::vector<Tensor*>& params, i32 dim, i32 blocks, i32 ctx) {
         std::lock_guard<std::mutex> lk(mu);
@@ -339,19 +510,15 @@ struct AsyncSaver {
                 fflush(stderr);
                 return;
             }
-            if (!Serialize::save_model(mp, ckpt, snap.dim, snap.blocks, snap.ctx)) {
-                fprintf(stderr, "  WARNING: failed to save model checkpoint to %s\n", mp.c_str());
+            std::vector<Tensor*> om, ov;
+            for (auto& t : snap.m) om.push_back(&t);
+            for (auto& t : snap.v) ov.push_back(&t);
+            if (!Serialize::CheckpointPair::publish(mp, op, ckpt,
+                                                    snap.dim, snap.blocks, snap.ctx,
+                                                    om, ov, snap.t)) {
+                fprintf(stderr, "  WARNING: failed to publish checkpoint pair %s / %s\n",
+                        mp.c_str(), op.c_str());
                 fflush(stderr);
-                return; // do not publish a newer optimizer against an older model
-            }
-            if (!snap.m.empty()) {
-                std::vector<Tensor*> om, ov;
-                for (auto& t : snap.m) om.push_back(&t);
-                for (auto& t : snap.v) ov.push_back(&t);
-                if (!Serialize::save_optimizer(op, om, ov, snap.t)) {
-                    fprintf(stderr, "  WARNING: failed to save optimizer state to %s\n", op.c_str());
-                    fflush(stderr);
-                }
             }
         });
     }

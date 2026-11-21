@@ -237,16 +237,19 @@ P3-нотатки (MaxPool tie-gap, `(f32)vocab_size`, soft labels) зафікс
 
 `Serialize::save`, `save_model`, `save_optimizer` писали напряму в ціль (`fopen(path, "wb")` одразу обрізає старий файл): переривання лишало урізаний checkpoint. Додано `Serialize::detail::write_atomic()` — запис у сусідній `path + ".tmp"`, `fflush`, `fclose`, потім одна атомарна заміна (`MoveFileExA(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` / `rename`). Помилка видаляє temp і не чіпає ціль. `save_gpt()` тепер використовує той самий `atomic_replace` замість локальної копії — формат v2 (SHDG + версія + CRC) не змінено.
 
-`AsyncSaver` отримав конфігуровані шляхи (default як раніше), скидання optimizer-стану в `queue_model()`, `join` попереднього потоку в `spawn()` (інакше присвоєння joinable `std::thread` → `std::terminate`), перевірку результатів `save_model`/`save_optimizer` із попередженням на stderr. Якщо модель не записалась, optimizer не публікується окремо. Документовано, що цей шлях пише legacy SHDE, а не v2 SHDG checkpoint.
+`AsyncSaver` отримав конфігуровані шляхи (default як раніше), скидання optimizer-стану в `queue_model()`, `join` попереднього потоку в `spawn()` (інакше присвоєння joinable `std::thread` → `std::terminate`), RAII-деструктор `~AsyncSaver() { flush(); }` і перевірку результату публікації з попередженням на stderr.
 
-Тести в `tests/serialize_checks.cpp`: успішний запис не лишає `.tmp`; застарілий `.tmp` від перерваного запису не впливає на good-файл; заблокований `.tmp` → помилка, старі байти й старий model завантажуються; NaN-тензори відхиляються до запису; те саме для optimizer; AsyncSaver — round-trip, подвійний `spawn()` без `flush()`, NaN-снапшот лишає last good, failed model save не публікує optimizer.
+**P2 (аудит `36a4b3b`) — узгодженість пари model + optimizer.** Дві окремо атомарні публікації не гарантують узгодженості: успішна модель + помилка optimizer лишає нову модель зі старим `t`/m/v, і обидва `load_*` приймають такий мікс. Додано `Serialize::CheckpointPair`: модель і optimizer пишуться як `base.gN` / `opt.gN`, перевіряються, і лише потім атомарно замінюється крихкий маніфест `base.manifest` (magic "PAIR", `gen`, `flags`) — єдине джерело істини. Читач бачить або стару пару, або нову; проміжні `gN`-файли ігноруються. Після публікації збираються всі покоління крім двох останніх. Відсутній маніфест → legacy-fallback на звичайні `base`/`opt`. `CheckpointPair::load` стейджить обидва файли й комітить разом, тому пошкоджений optimizer не оновлює модель частково. Для стейджу `load_model`/`load_optimizer` переведено на спільні `detail::read_model_blocks` / `read_optimizer_blocks` — зовнішня поведінка не змінилась.
 
-Негативні контролі (фактично запускались): повернення прямого запису → 5 `FAIL`, `atomic_checks: FAILED`, `exit=1`; прибраний `join` у `spawn()` → процес аварійно завершується `0xC0000409` (`std::terminate`).
+Тести в `tests/serialize_checks.cpp`: atomic — успішний запис не лишає `.tmp`; застарілий `.tmp` не впливає на good-файл; заблокований `.tmp` → старі байти й старий model; NaN відхиляється до запису; AsyncSaver — round-trip, подвійний `spawn()`, NaN-снапшот лишає last good. `pair_checks()` — 8 кейсів: g1 round-trip, **модель записана / optimizer заблокований → читач лишається на g1** (плюс доказ, що окремі `load_*` приймають мікс), recovery, корупція маніфесту, отруєний optimizer g3 без часткового commit, GC, model-only generation, legacy fallback.
+
+Негативні контролі (фактично запускались): прямий запис `save_model` → 5 `FAIL`, `exit=1`; прибраний `join` у `spawn()` → `0xC0000409` (`std::terminate`); повернення прямої публікації без маніфеста → `FAIL: publish fails when optimizer temp blocked`, `reader still sees old pair` (`pair_checks: FAILED`).
 
 ### Ще не зроблено
 
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
-- Формати SHDE (AsyncSaver) і SHDG v2 (GPT) лишаються окремими; уніфікація не потрібна, поки обидва loader-и працюють.
+- Power-loss durability: `fflush`/`fclose` без `fsync` файлу й каталогу дають атомарну **видимість** за crash процесу, але не гарантію після знеструмлення (POSIX `rename`, Windows `MOVEFILE_WRITE_THROUGH`).
+- Формати SHDE generation-файлів і SHDG v2 (GPT) лишаються окремими — уніфікація не потрібна.
 
 ---
 

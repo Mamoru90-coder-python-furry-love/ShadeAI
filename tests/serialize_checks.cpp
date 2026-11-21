@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -42,6 +43,37 @@ static bool append_garbage(const fs::path& src, const fs::path& dst) {
     auto data = read_all(src);
     data.push_back(0x42);
     return write_all(dst, data);
+}
+
+static void remove_pair_files(const fs::path& model, const fs::path& opt) {
+    fs::remove(model.string() + ".manifest");
+    fs::remove(model.string() + ".manifest.tmp");
+    for (i32 g = 1; g <= 8; g++) {
+        const std::string n = std::to_string(g);
+        fs::remove(model.string() + ".g" + n);
+        fs::remove(opt.string() + ".g" + n);
+        fs::remove(model.string() + ".g" + n + ".tmp");
+        fs::remove(opt.string() + ".g" + n + ".tmp");
+    }
+}
+
+struct PairLoad {
+    bool valid = false;
+    Serialize::ModelInfo info{ 0, 0, 0, false };
+    bool has_opt = false;
+    i32 t = 0;
+    f32 model0 = -7.0f, m0 = -7.0f, v0 = -7.0f;
+};
+
+static PairLoad read_pair(const fs::path& pm, const fs::path& po) {
+    PairLoad r;
+    Tensor a(2, 3), m(2, 3), v(2, 3);
+    fill(a, -7.0f); fill(m, -7.0f); fill(v, -7.0f);
+    auto x = Serialize::CheckpointPair::load(pm.string(), po.string(),
+                                             { &a }, { &m }, { &v });
+    r.valid = x.valid; r.info = x.info; r.has_opt = x.has_opt; r.t = x.t;
+    r.model0 = a.data[0]; r.m0 = m.data[0]; r.v0 = v.data[0];
+    return r;
 }
 
 // Atomic publishing: a failed/interrupted write must never touch the previous
@@ -123,50 +155,156 @@ static int atomic_and_async_checks() {
         saver.spawn();
         saver.flush(); // process surviving is the negative control for terminate
 
-        Tensor got(2, 3); fill(got, -7.0f);
-        info = Serialize::load_model(amodel.string(), { &got });
-        expect(info.valid && info.dim == 4 && info.blocks == 2 && info.ctx == 16,
+        auto r = read_pair(amodel, aopt);
+        expect(r.valid && r.info.dim == 4 && r.info.blocks == 2 && r.info.ctx == 16,
                "async model info");
-        expect(got.data[0] == 5.0f, "async second snapshot published");
-        expect(!fs::exists(amodel_tmp), "no async temp left behind");
+        expect(r.model0 == 5.0f, "async second snapshot published");
+        expect(!r.has_opt, "model-only generation has no optimizer");
 
         // NaN snapshot: keep the last good checkpoint.
         fill(w, std::numeric_limits<f32>::quiet_NaN());
         saver.queue_model(wp, 4, 2, 16);
         saver.spawn(); saver.flush();
-        fill(got, -7.0f);
-        info = Serialize::load_model(amodel.string(), { &got });
-        expect(info.valid && got.data[0] == 5.0f, "NaN snapshot keeps last good model");
+        r = read_pair(amodel, aopt);
+        expect(r.valid && r.model0 == 5.0f, "NaN snapshot keeps last good model");
 
-        // Failed model publish must not advance the optimizer sidecar alone.
-        const auto opt_before = fs::exists(aopt) ? read_all(aopt) : std::vector<char>{};
-        fs::create_directory(amodel_tmp);
+        // Happy path with optimizer: generation-stamped model + sidecar.
         fill(w, 8.0f);
-        saver.queue_model(wp, 4, 2, 16);
-        saver.queue_opt(ms, vs, 21);
-        saver.spawn(); saver.flush();
-        expect(!fs::exists(aopt) || read_all(aopt) == opt_before,
-               "failed model save does not publish optimizer alone");
-        fs::remove(amodel_tmp);
-
-        // Happy path with optimizer: SHDE model + sidecar round-trip.
         saver.queue_model(wp, 4, 2, 16);
         saver.queue_opt(ms, vs, 33);
         saver.spawn(); saver.flush();
-        fill(got, -7.0f);
-        info = Serialize::load_model(amodel.string(), { &got });
-        expect(info.valid && got.data[0] == 8.0f, "async model+opt model load");
-        Tensor dm(2, 3), dv(2, 3);
-        i32 t = 0;
-        expect(Serialize::load_optimizer(aopt.string(), { &dm }, { &dv }, t), "async optimizer load");
-        expect(t == 33 && dm.data[0] == 0.25f && dv.data[0] == 0.5f, "async optimizer values");
+        r = read_pair(amodel, aopt);
+        expect(r.valid && r.model0 == 8.0f && r.has_opt && r.t == 33, "async pair round-trip");
+        expect(r.m0 == 0.25f && r.v0 == 0.5f, "async optimizer values");
     }
 
     for (const auto& p : { model, opt, amodel, aopt, model_tmp, opt_tmp, amodel_tmp, aopt_tmp })
         fs::remove(p);
+    remove_pair_files(amodel, aopt);
 
     if (!ok) { std::fprintf(stderr, "atomic_checks: FAILED\n"); return 1; }
     std::puts("atomic_checks: OK");
+    return 0;
+}
+
+// P2 from the 36a4b3b audit: two individually atomic files can still form a
+// mismatched pair. The manifest must make the pair a single observable unit.
+static int pair_checks() {
+    const fs::path dir = fs::temp_directory_path();
+    const fs::path pm = dir / "shade_pair_model.bin";
+    const fs::path po = dir / "shade_pair_opt.bin";
+    remove_pair_files(pm, po);
+    fs::remove(pm); fs::remove(po);
+
+    bool ok = true;
+    auto expect = [&](bool cond, const char* what) {
+        if (!cond) { std::fprintf(stderr, "FAIL: %s\n", what); ok = false; }
+    };
+
+    Tensor a(2, 3), m(2, 3), v(2, 3);
+    fill(a, 1.0f); fill(m, 0.25f); fill(v, 0.5f);
+    std::vector<Tensor*> ap{ &a }, ms{ &m }, vs{ &v };
+    const fs::path manifest(pm.string() + ".manifest");
+
+    // 1. First generation is published as a pair.
+    expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                              4, 2, 16, ms, vs, 7), "publish g1");
+    auto r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 1.0f && r.has_opt && r.t == 7 && r.m0 == 0.25f,
+           "g1 round-trip");
+    expect(fs::exists(pm.string() + ".g1") && fs::exists(po.string() + ".g1"), "g1 files exist");
+
+    // 2. P2 negative: model written, optimizer write blocked. The manifest must
+    //    stay on g1 even though the stray g2 model is already on disk.
+    const fs::path blocked(po.string() + ".g2.tmp");
+    fs::create_directory(blocked);
+    fill(a, 2.0f);
+    expect(!Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                               4, 2, 16, ms, vs, 8),
+           "publish fails when optimizer temp blocked");
+    expect(fs::exists(pm.string() + ".g2"), "g2 model written before failure");
+    expect(!fs::exists(po.string() + ".g2"), "g2 optimizer not written");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 1.0f && r.has_opt && r.t == 7, "reader still sees old pair");
+
+    // Prove why per-file atomicity is insufficient: both stray files load fine.
+    Tensor stray(2, 3), sm(2, 3), sv(2, 3);
+    fill(stray, -7.0f); fill(sm, -7.0f); fill(sv, -7.0f);
+    i32 st = -1;
+    expect(Serialize::load_model(pm.string() + ".g2", { &stray }).valid && stray.data[0] == 2.0f,
+           "stray new model loads on its own");
+    expect(Serialize::load_optimizer(po.string() + ".g1", { &sm }, { &sv }, st) && st == 7,
+           "old optimizer loads on its own");
+    fs::remove(blocked);
+
+    // 3. Recovery: the same generation is published correctly.
+    expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                              4, 2, 16, ms, vs, 9), "publish g2 retry");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 2.0f && r.t == 9, "g2 published after recovery");
+
+    // 4. Corrupt manifest is rejected without touching the tensors.
+    {
+        auto bytes = read_all(manifest);
+        expect(bytes.size() == 12, "manifest size");
+        if (bytes.size() == 12) {
+            const char orig = bytes[0];
+            bytes[0] = 'X';
+            expect(write_all(manifest, bytes), "corrupt manifest");
+            r = read_pair(pm, po);
+            expect(!r.valid && r.model0 == -7.0f && r.m0 == -7.0f, "corrupt manifest rejected");
+            bytes[0] = orig;
+            expect(write_all(manifest, bytes), "restore manifest");
+
+            auto huge = bytes;
+            const i32 big_gen = 2000000;
+            std::memcpy(huge.data() + 4, &big_gen, sizeof(big_gen));
+            expect(write_all(manifest, huge), "write huge-gen manifest");
+            r = read_pair(pm, po);
+            expect(!r.valid && r.model0 == -7.0f, "huge generation rejected");
+            expect(write_all(manifest, bytes), "restore manifest again");
+        }
+    }
+
+    // 5. Valid manifest but poisoned optimizer generation: staged load must not
+    //    commit the model half of the pair.
+    fill(a, 3.0f);
+    expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                              4, 2, 16, ms, vs, 11), "publish g3");
+    expect(poke_nan(fs::path(po.string() + ".g3"), 12), "poison g3 optimizer");
+    r = read_pair(pm, po);
+    expect(!r.valid && r.model0 == -7.0f && r.m0 == -7.0f, "poisoned pair leaves tensors untouched");
+
+    // 6. Next publish advances the manifest and collects old generations.
+    fill(a, 4.0f);
+    expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                              4, 2, 16, ms, vs, 13), "publish g4");
+    expect(!fs::exists(pm.string() + ".g2") && !fs::exists(po.string() + ".g2"),
+           "old generation collected");
+    expect(fs::exists(pm.string() + ".g4"), "latest generation kept");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 4.0f && r.t == 13, "g4 round-trip");
+
+    // 7. Model-only generation: no optimizer expected, moments untouched.
+    const std::vector<Tensor*> none;
+    expect(Serialize::CheckpointPair::publish(pm.string(), po.string(), ap,
+                                              4, 2, 16, none, none, 0), "publish g5 model-only");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 4.0f && !r.has_opt && r.m0 == -7.0f, "model-only pair");
+
+    // 8. Legacy plain files remain readable when there is no manifest.
+    remove_pair_files(pm, po);
+    fs::remove(pm); fs::remove(po);
+    fill(a, 6.0f);
+    expect(Serialize::save_model(pm.string(), ap, 4, 2, 16), "legacy save model");
+    expect(Serialize::save_optimizer(po.string(), ms, vs, 21), "legacy save opt");
+    r = read_pair(pm, po);
+    expect(r.valid && r.model0 == 6.0f && r.has_opt && r.t == 21, "legacy pair fallback");
+
+    remove_pair_files(pm, po);
+    fs::remove(pm); fs::remove(po);
+    if (!ok) { std::fprintf(stderr, "pair_checks: FAILED\n"); return 1; }
+    std::puts("pair_checks: OK");
     return 0;
 }
 
@@ -261,6 +399,7 @@ int main() {
 
     for (const auto& p : { model, bad, plain, opt }) fs::remove(p);
     if (atomic_and_async_checks() != 0) ok = false;
+    if (pair_checks() != 0) ok = false;
 
     if (!ok) { std::fprintf(stderr, "serialize_checks: FAILED\n"); return 1; }
     std::puts("serialize_checks: OK");
