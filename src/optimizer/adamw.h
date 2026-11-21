@@ -17,6 +17,21 @@ struct AdamW {
     }
 
     void step(const std::vector<Tensor*>& params, const std::vector<Tensor*>& grads) {
+        // Caller contract: validate the WHOLE set before touching anything.
+        // An invalid combination is a no-op — no parameter, moment or step
+        // counter is modified. Previously grads[i]/m[i]/v[i] were indexed by
+        // params.size() with no checks, so a short vector meant out-of-bounds
+        // access (undefined behaviour) and a long one silently ignored data.
+        const size_t np = params.size();
+        if (np == 0 || grads.size() != np || m.size() != np || v.size() != np) return;
+        for (size_t i = 0; i < np; ++i) {
+            const Tensor* p = params[i];
+            const Tensor* g = grads[i];
+            if (!p || !g) return;
+            if (p->rows != g->rows || p->cols != g->cols) return;
+            if (p->rows != m[i].rows || p->cols != m[i].cols) return;
+            if (p->rows != v[i].rows || p->cols != v[i].cols) return;
+        }
         t++;
         // bias-correction factors + fused step coefficients — computed ONCE per step
         f32 p1t = std::pow(beta1, t);

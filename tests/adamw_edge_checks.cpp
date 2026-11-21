@@ -53,6 +53,7 @@ static double grad_for(int i, GradMode mode) {
 struct RunResult {
     double worst = 0.0;
     bool prod_nan = false, ref_nan = false;
+    int finite_mismatch = 0;      // indices where finiteness differs from reference
     int first_divergent_index = -1;
 };
 
@@ -84,6 +85,7 @@ static RunResult compare_run(double lr, double wd, double b1, double b2, double 
         const bool wf = std::isfinite(want), gf = std::isfinite(got);
         if (!wf) r.ref_nan = true;
         if (!gf) r.prod_nan = true;
+        if (wf != gf) ++r.finite_mismatch;
         if (!wf || !gf) continue;
         const double d = std::fabs(got - want);
         if (d > r.worst) { r.worst = d; r.first_divergent_index = i; }
@@ -95,10 +97,11 @@ int main() {
     bool ok = true;
     auto report = [&](const char* name, const RunResult& r, double tol) {
         const bool finite_agreement = r.prod_nan == r.ref_nan;
-        const bool good = finite_agreement && near(r.worst, 0.0, tol);
-        std::printf("  %-28s %s worst=%.6g tol=%.3g prodNaN=%d refNaN=%d i=%d\n",
+        const bool good = finite_agreement && r.finite_mismatch == 0
+                          && near(r.worst, 0.0, tol);
+        std::printf("  %-28s %s worst=%.6g tol=%.3g prodNaN=%d refNaN=%d finDiff=%d i=%d\n",
                     name, good ? "OK" : "FAIL", r.worst, tol,
-                    r.prod_nan, r.ref_nan, r.first_divergent_index);
+                    r.prod_nan, r.ref_nan, r.finite_mismatch, r.first_divergent_index);
         if (!good) ok = false;
     };
     auto math_case = [&](const char* name, double lr, double wd, double b1,
@@ -154,12 +157,16 @@ int main() {
         std::vector<Tensor*> ps{ &p }, gs{ &g };
         opt.step(ps, gs); ref.step(pref, gref);
         double worst = 0.0;
+        int fin_diff = 0;
         for (int i = 0; i < n; ++i) {
             if (i == 5) continue;
+            if (std::isfinite(p.data[i]) != std::isfinite(pref[i])) ++fin_diff;
             worst = std::max(worst, std::fabs((double)p.data[i] - pref[i]));
         }
-        report("nan_gradient_is_local", { worst, false, false, -1 }, 1e-4);
-        if (!std::isnan(p.data[5])) { std::fprintf(stderr, "FAIL: nan gradient did not reach its own weight\n"); ok = false; }
+        report("nan_gradient_is_local", { worst, false, false, fin_diff, -1 }, 1e-4);
+        if (!std::isnan(p.data[5]) || !std::isnan(pref[5])) {
+            std::fprintf(stderr, "FAIL: nan gradient did not reach its own weight\n"); ok = false;
+        }
     }
     {
         const int n = 24;
@@ -179,11 +186,17 @@ int main() {
         std::vector<Tensor*> ps{ &p }, gs{ &g };
         opt.step(ps, gs); ref.step(pref, gref);
         double worst = 0.0;
+        int fin_diff = 0;
         for (int i = 0; i < n; ++i) {
-            if (i == 11 || !std::isfinite(pref[i])) continue;
+            if (i == 11) continue;
+            if (std::isfinite(p.data[i]) != std::isfinite(pref[i])) ++fin_diff;
+            if (!std::isfinite(pref[i])) continue;
             worst = std::max(worst, std::fabs((double)p.data[i] - pref[i]));
         }
-        report("inf_gradient_is_local", { worst, false, false, -1 }, 1e-4);
+        report("inf_gradient_is_local", { worst, false, false, fin_diff, -1 }, 1e-4);
+        if (!std::isnan(p.data[11]) || !std::isnan(pref[11])) {
+            std::fprintf(stderr, "FAIL: inf gradient must give NaN only at its own index\n"); ok = false;
+        }
     }
     {
         // Pre-poisoned moment at one element must not spread to neighbours.
@@ -204,11 +217,17 @@ int main() {
         std::vector<Tensor*> ps{ &p }, gs{ &g };
         opt.step(ps, gs); ref.step(pref, gref);
         double worst = 0.0;
+        int fin_diff = 0;
         for (int i = 0; i < n; ++i) {
-            if (i == 7 || !std::isfinite(pref[i])) continue;
+            if (i == 7) continue;
+            if (std::isfinite(p.data[i]) != std::isfinite(pref[i])) ++fin_diff;
+            if (!std::isfinite(pref[i])) continue;
             worst = std::max(worst, std::fabs((double)p.data[i] - pref[i]));
         }
-        report("nan_moment_is_local", { worst, false, false, -1 }, 1e-4);
+        report("nan_moment_is_local", { worst, false, false, fin_diff, -1 }, 1e-4);
+        if (!std::isnan(p.data[7]) || !std::isnan(pref[7])) {
+            std::fprintf(stderr, "FAIL: nan moment must give NaN only at its own index\n"); ok = false;
+        }
     }
 
     {
@@ -230,15 +249,21 @@ int main() {
         std::vector<Tensor*> ps{ &p }, gs{ &g };
         opt.step(ps, gs); ref.step(pref, gref);
         double worst = 0.0;
+        int fin_diff = 0;
         for (int i = 0; i < n; ++i) {
-            if (i == 3 || !std::isfinite(pref[i])) continue;
+            if (i == 3) continue;
+            if (std::isfinite(p.data[i]) != std::isfinite(pref[i])) ++fin_diff;
+            if (!std::isfinite(pref[i])) continue;
             worst = std::max(worst, std::fabs((double)p.data[i] - pref[i]));
         }
-        report("nan_param_is_local", { worst, false, false, -1 }, 1e-4);
+        report("nan_param_is_local", { worst, false, false, fin_diff, -1 }, 1e-4);
         if (!std::isnan(p.data[3])) { std::fprintf(stderr, "FAIL: poisoned parameter stayed finite\n"); ok = false; }
     }
 
-    std::puts("[clip -> decay interaction]");
+    // NOTE: this scales gradients manually with the same norm formula as
+    // GPT::clip_grads(1.0f); it does NOT call clip_grads itself, so it checks
+    // AdamW with pre-clipped gradients, not the clipping function/integration.
+    std::puts("[pre-clipped gradients -> decay interaction]");
     {
         const int n = 37;
         std::vector<double> graw(n);
@@ -263,7 +288,7 @@ int main() {
         for (int s = 0; s < 5; ++s) { opt.step(ps, gs); ref.step(pref, gclipped); }
         double worst = 0.0;
         for (int i = 0; i < n; ++i) worst = std::max(worst, std::fabs((double)p.data[i] - pref[i]));
-        report("clip_then_decay", { worst, false, false, -1 }, 1e-4);
+        report("preclipped_then_decay", { worst, false, false, 0, -1 }, 1e-4);
     }
 
     if (!ok) { std::fprintf(stderr, "adamw_edge_checks: FAILED\n"); return 1; }
