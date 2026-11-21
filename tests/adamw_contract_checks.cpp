@@ -107,6 +107,36 @@ int main() {
         { filled(1, 8, 0.0f), filled(1, 8, 0.0f), filled(1, 8, 0.0f) },
         { filled(1, 8, 0.0f), filled(1, 8, 0.0f), filled(1, 8, 0.0f) });
 
+    // data.size() may be changed independently of rows/cols because all
+    // Tensor fields are public. Directions below keep the unfixed kernel
+    // in-bounds: params side is SHORT (loop count follows params->size()),
+    // the other three sides are LONG (only the first 8 elements are used).
+    std::puts("[data.size() desynchronised from rows/cols]");
+    {
+        auto p = std::vector<Tensor>{ filled(1, 8, 1.0f) };
+        p[0].data.resize(4);
+        run("params data.size() 4 vs 8", p, { filled(1, 8, 1.0f) },
+            { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) });
+    }
+    {
+        auto g = std::vector<Tensor>{ filled(1, 8, 1.0f) };
+        g[0].data.resize(12);
+        run("grads data.size() 12 vs 8", { filled(1, 8, 1.0f) }, g,
+            { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) });
+    }
+    {
+        auto m = std::vector<Tensor>{ filled(1, 8, 0.0f) };
+        m[0].data.resize(12);
+        run("m data.size() 12 vs 8", { filled(1, 8, 1.0f) }, { filled(1, 8, 1.0f) },
+            m, { filled(1, 8, 0.0f) });
+    }
+    {
+        auto v = std::vector<Tensor>{ filled(1, 8, 0.0f) };
+        v[0].data.resize(12);
+        run("v data.size() 12 vs 8", { filled(1, 8, 1.0f) }, { filled(1, 8, 1.0f) },
+            { filled(1, 8, 0.0f) }, v);
+    }
+
     std::puts("[control: well-formed call must still update]");
     {
         std::vector<Tensor> p{ filled(1, 8, 1.0f) }, g{ filled(1, 8, 1.0f) };

@@ -24,6 +24,13 @@ struct AdamW {
         // access (undefined behaviour) and a long one silently ignored data.
         const size_t np = params.size();
         if (np == 0 || grads.size() != np || m.size() != np || v.size() != np) return;
+        // rows/cols are public and so is data — a caller can resize data
+        // without updating the shape. The kernel iterates params[i]->size()
+        // (i.e. data.size()), so shape agreement alone is not enough.
+        auto data_matches_shape = [](const Tensor& t) {
+            if (t.rows < 0 || t.cols < 0) return false;
+            return t.data.size() == static_cast<size_t>(t.rows) * static_cast<size_t>(t.cols);
+        };
         for (size_t i = 0; i < np; ++i) {
             const Tensor* p = params[i];
             const Tensor* g = grads[i];
@@ -31,6 +38,11 @@ struct AdamW {
             if (p->rows != g->rows || p->cols != g->cols) return;
             if (p->rows != m[i].rows || p->cols != m[i].cols) return;
             if (p->rows != v[i].rows || p->cols != v[i].cols) return;
+            if (!data_matches_shape(*p) || !data_matches_shape(*g) ||
+                !data_matches_shape(m[i]) || !data_matches_shape(v[i])) return;
+            const size_t want = p->data.size();
+            if (g->data.size() != want || m[i].data.size() != want ||
+                v[i].data.size() != want) return;
         }
         t++;
         // bias-correction factors + fused step coefficients — computed ONCE per step
