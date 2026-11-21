@@ -251,7 +251,7 @@ P3-нотатки (MaxPool tie-gap, `(f32)vocab_size`, soft labels) зафікс
 
 ### Маркування `shade.exe` — VERSIONINFO
 
-Окремим комітом (не змішується з виправленнями ядра) додано `src/shade.rc` із `VS_VERSION_INFO`: `CompanyName=ShadeFurry Technologies`, `ProductName=ShadeAI`, `FileDescription=ShadeAI Application`, `LegalCopyright=ShadeFurry Technologies`, `FileVersion/ProductVersion=1.0.0.0`, `OriginalFilename=shade.exe`. `build\compile.bat` тепер вимагає `cl` **і** `rc` (обидва з `vcvars64.bat`), збирає `build\shade.res` і лінкує його в `shade.exe`; `*.res` додано до `.gitignore`. Фактично перевірено через `(Get-Item build\shade.exe).VersionInfo` — усі поля зчитуються.
+Окремим комітом (не змішується з виправленнями ядра) додано `src/shade.rc` із `VS_VERSION_INFO`: `CompanyName=ShadeFurry Technologies`, `ProductName=ShadeAI`, `FileDescription=ShadeAI Application`, `LegalCopyright=ShadeFurry Technologies`, `FileVersion/ProductVersion=1.0.0.0`, `OriginalFilename=shade.exe`. `build\compile.bat` тепер вимагає `cl` **і** `rc` (обидва з `vcvars64.bat`), збирає `build\shade.res` і лінкує його в `shade.exe`; `*.res` додано до `.gitignore`. Після ініціалізації середовища повторно перевіряються `vswhere`/`vcvars64.bat`/`cl`/`rc` — у разі невдачі скрипт падає зі зрозумілим повідомленням замість плутаної помилки `rc` (P3-нотатка аудиту `fdab597`). Негативний контроль: `VSPATH=C:\bogus-vs-path` → `vcvars64.bat not found`, `exit=1`. Фактично перевірено через `(Get-Item build\shade.exe).VersionInfo` — усі поля зчитуються.
 
 **Це метадані, а не Authenticode.** Windows не вважає файл криптографічно підписаним. Для справжнього підпису потрібен code-signing сертифікат і `signtool sign`; цей крок не виконано.
 
