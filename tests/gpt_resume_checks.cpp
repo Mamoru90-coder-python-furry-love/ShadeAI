@@ -44,13 +44,14 @@ static bool poke_i32(const fs::path& p, size_t off, i32 v, bool seal) {
     return seal ? reseal(p) : true;
 }
 // Offsets of the v3 resume section, derived from the file tail so the tests
-// do not depend on tokenizer length.
-struct ResumeOffsets { size_t epoch, has_opt, n, first_rows, t; };
+// do not depend on tokenizer length. New writers append a 4-byte batch size
+// after t; legacy v3 files omit it.
+struct ResumeOffsets { size_t epoch, has_opt, n, first_rows, t, batch_size; };
 static bool resume_offsets(const fs::path& p, const std::vector<Tensor>& m,
                            ResumeOffsets& out) {
     size_t blocks = 0;
     for (const auto& t : m) blocks += 8 + (size_t)t.rows * t.cols * 4;
-    const size_t bytes = 16 + 4 + 2 * blocks + 4;
+    const size_t bytes = 16 + 4 + 2 * blocks + 4 + 4;
     const size_t size = read_all(p).size();
     if (size < bytes) return false;
     const size_t off = size - bytes;
@@ -59,6 +60,7 @@ static bool resume_offsets(const fs::path& p, const std::vector<Tensor>& m,
     out.n = off + 16;
     out.first_rows = off + 20;
     out.t = off + 20 + 2 * blocks;
+    out.batch_size = out.t + 4;
     return true;
 }
 
@@ -83,9 +85,14 @@ int main() {
     const fs::path maxcalls = dir / "shade_gpt_resume_maxcalls.bin";
     const fs::path tmaxsave = dir / "shade_gpt_resume_tmaxsave.bin";
     const fs::path nearmax = dir / "shade_gpt_resume_nearmax.bin";
+    const fs::path otherbs = dir / "shade_gpt_resume_otherbs.bin";
+    const fs::path legacybs = dir / "shade_gpt_resume_legacybs.bin";
+    const fs::path badbs = dir / "shade_gpt_resume_badbs.bin";
+    const fs::path badfresh = dir / "shade_gpt_resume_badfresh.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls, tmaxsave, nearmax })
+                           shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
+                           legacybs, badbs, badfresh })
         fs::remove(p);
 
     bool ok = true;
@@ -127,6 +134,23 @@ int main() {
                     rb.epoch, rb.t, rb.rand_calls, worst);
     }
     expect(same_bytes(full, part), "3 epochs == 2 + resume (byte-identical)");
+
+    // The stored batch size must win over a caller-supplied override. Before
+    // it was serialized, bs=3 here diverged from the uninterrupted bs=2 run.
+    {
+        GPTTrainConfig changed_bs = small;
+        changed_bs.batch_size = 3;
+        // part was resumed to epoch 3 above; twoonly is the untouched epoch-2
+        // checkpoint, so this call really enters the training loop.
+        expect(fs::copy_file(twoonly, otherbs), "stage checkpoint for batch-size override");
+        expect(train_gpt(data.string(), otherbs.string(), true, changed_bs),
+               "resume with ignored batch_size override succeeds");
+        expect(same_bytes(full, otherbs), "stored batch_size beats caller override");
+        GPTConfig co{}; Tokenizer to; std::vector<Tensor> wo; GPTResume ro;
+        expect(read_gpt_checkpoint(otherbs.string(), co, to, wo,
+                                   Tokenizer::MAX_BYTES, &ro) &&
+               ro.batch_size == 2, "checkpoint stores the original batch_size");
+    }
 
     GPTConfig cfg{}; Tokenizer tok; std::vector<Tensor> weights; GPTResume res;
     bool read_ok = read_gpt_checkpoint(full.string(), cfg, tok, weights,
@@ -186,9 +210,13 @@ int main() {
             rejected("t=INT32_MAX rejected", [&] {
                 return poke_i32(bad, o.t, std::numeric_limits<i32>::max(), true);
             });
-            // Truncation of the resume tail.
+            rejected("batch_size=0 rejected", [&] {
+                return poke_i32(bad, o.batch_size, 0, true);
+            });
+            // Removing only the trailing batch-size field is a LEGACY v3 file
+            // and stays valid; cut deeper to truncate the actual resume state.
             rejected("truncated resume section rejected", [&] {
-                auto b = bytes; b.resize(b.size() - 4); return write_all(bad, b);
+                auto b = bytes; b.resize(b.size() - 8); return write_all(bad, b);
             });
 
             // The writer must not publish a counter that the reader rejects.
@@ -220,6 +248,38 @@ int main() {
                 expect(!read_gpt_checkpoint(nearmax.string(), cn, tn, wn,
                                             Tokenizer::MAX_BYTES, &rn),
                        "explicit resume rejects terminal t");
+            }
+
+            // The writer must not publish a counter the reader rejects — same
+            // rule for the newly serialized batch size.
+            {
+                GPT gbad(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+                auto gp = gbad.params();
+                for (size_t i = 0; i < gp.size(); ++i) gp[i]->data = weights[i].data;
+                GPTResume bad = res;
+                bad.batch_size = 0;
+                expect(!save_gpt(badbs.string(), gbad, tok, &bad),
+                       "save_gpt rejects batch_size=0");
+
+                GPTTrainConfig invalid = small;
+                invalid.batch_size = 0;
+                expect(!train_gpt(data.string(), badfresh.string(), false, invalid),
+                       "fresh run rejects batch_size=0");
+            }
+
+            // A v3 file written before the trailing field ended after t. It is
+            // still a valid checkpoint and resumes with the historical default.
+            {
+                auto b = read_all(full);
+                b.resize(b.size() - 4);
+                expect(write_all(legacybs, b) && reseal(legacybs),
+                       "stage legacy v3 without batch_size");
+                GPTConfig cl{}; Tokenizer tl; std::vector<Tensor> wl; GPTResume rl;
+                expect(read_gpt_checkpoint(legacybs.string(), cl, tl, wl,
+                                           Tokenizer::MAX_BYTES, &rl),
+                       "legacy v3 without batch_size still resumes");
+                expect(rl.batch_size == GPT_DEFAULT_BATCH_SIZE,
+                       "legacy v3 defaults batch_size to 8");
             }
 
             // ---- 4. sensitivity: zeroing m/v must change the continuation ----
@@ -361,8 +421,9 @@ int main() {
                "raised epoch limit advances checkpoint to epoch 4");
     }
 
-    // Training-only knobs are not serialized; architecture is. A caller that
-    // passes different dim/blocks/max_len still gets the checkpoint's shapes.
+    // Architecture is not serialized as a train knob; it comes from the model
+    // header. A caller that passes different dim/blocks/max_len still gets the
+    // checkpoint's shapes. batch_size is now serialized separately above.
     {
         expect(fs::copy_file(full, arch), "stage architecture-override checkpoint");
         GPTTrainConfig override = small;
@@ -394,7 +455,8 @@ int main() {
 
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls, tmaxsave, nearmax })
+                           shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
+                           legacybs, badbs, badfresh })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");

@@ -245,6 +245,14 @@ static constexpr i32 GPT_VERSION_V2 = 2;
 // v3 appends a resume section after the weight blocks: training progress,
 // the exact RNG position, and the AdamW moments. v1/v2 remain readable.
 static constexpr i32 GPT_VERSION_V3 = 3;
+// A trailing i32 in the v3 resume section stores the accumulation batch size.
+// Old v3 files end right after t; they stay readable with the historical
+// default instead of being rejected or silently given a new format version.
+static constexpr i32 GPT_DEFAULT_BATCH_SIZE = 8;
+static constexpr i32 GPT_MAX_BATCH_SIZE = 1000000;
+static inline bool gpt_batch_size_valid(i32 bs) {
+    return bs >= 1 && bs <= GPT_MAX_BATCH_SIZE;
+}
 static constexpr size_t GPT_CRC_OFFSET = 8;
 // v3 stages two extra copies of the parameters (m and v) on load. Keep the
 // hostile-file allocation bounded before anything is read into RAM.
@@ -271,6 +279,7 @@ struct GPTResume {
     i32 rand_calls = 0;   // shade_rand() calls consumed so far
     bool has_opt = false;
     i32 t = 0;
+    i32 batch_size = GPT_DEFAULT_BATCH_SIZE; // accumulated micro-batches per step
     std::vector<Tensor> m, v;
 };
 
@@ -527,7 +536,7 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
     if (resume && ok) {
         if (resume->epoch < 0 || resume->rand_seed < 0 ||
             resume->rand_calls < 0 || resume->rand_calls > GPT_MAX_RAND_REPLAY ||
-            !adamw_t_valid(resume->t))
+            !adamw_t_valid(resume->t) || !gpt_batch_size_valid(resume->batch_size))
             ok = false;
         if (resume->has_opt) {
             if (resume->m.size() != params.size() || resume->v.size() != params.size())
@@ -554,6 +563,7 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
             for (const auto& vt : resume->v) { if (!ok) break; ok = write_tensor(f, vt); }
             wi(resume->t);
         }
+        wi(resume->batch_size); // new files; legacy v3 ends after t
     }
 
     if (ok) {
@@ -651,43 +661,54 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                 parsed_resume.rand_seed = seed;
                 parsed_resume.rand_calls = calls;
                 parsed_resume.has_opt = has_opt != 0;
-                if (!has_opt) return true;
+                if (has_opt) {
+                    i32 n = 0;
+                    if (!read_i32(f, n) || n != (i32)expected.size()) return false;
+                    if (expected_params > GPT_MAX_RESUME_ELEMS / 3) return false;
+                    int64_t used = 0;
+                    parsed_resume.m.reserve(expected.size());
+                    for (size_t i = 0; i < expected.size(); ++i) {
+                        Tensor t;
+                        const size_t remaining = (size_t)(expected_params - used);
+                        if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
+                            return false;
+                        used += (int64_t)t.rows * t.cols;
+                        parsed_resume.m.push_back(std::move(t));
+                    }
+                    if ((i32)parsed_resume.m.size() != n || used != expected_params) return false;
+                    used = 0;
+                    parsed_resume.v.reserve(expected.size());
+                    for (size_t i = 0; i < expected.size(); ++i) {
+                        Tensor t;
+                        const size_t remaining = (size_t)(expected_params - used);
+                        if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
+                            return false;
+                        used += (int64_t)t.rows * t.cols;
+                        parsed_resume.v.push_back(std::move(t));
+                    }
+                    if ((i32)parsed_resume.v.size() != n || used != expected_params) return false;
+                    i32 rt = 0;
+                    if (!read_i32(f, rt) || !adamw_t_valid(rt)) return false;
+                    // A terminal counter is still readable for inference, but an
+                    // explicit resume could never take another savable step.
+                    if (resume && !adamw_t_can_step(rt)) return false;
+                    parsed_resume.t = rt;
+                    for (const auto& t : parsed_resume.m)
+                        if (Serialize::has_naninf_tensor(t)) return false;
+                    for (const auto& t : parsed_resume.v)
+                        if (Serialize::has_naninf_tensor(t)) return false;
+                }
 
-                i32 n = 0;
-                if (!read_i32(f, n) || n != (i32)expected.size()) return false;
-                if (expected_params > GPT_MAX_RESUME_ELEMS / 3) return false;
-                int64_t used = 0;
-                parsed_resume.m.reserve(expected.size());
-                for (size_t i = 0; i < expected.size(); ++i) {
-                    Tensor t;
-                    const size_t remaining = (size_t)(expected_params - used);
-                    if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
-                        return false;
-                    used += (int64_t)t.rows * t.cols;
-                    parsed_resume.m.push_back(std::move(t));
+                // Trailing batch size: new writers append it; old v3 files
+                // simply end here and keep the historical default.
+                i32 bs = GPT_DEFAULT_BATCH_SIZE;
+                const size_t got = fread(&bs, 1, sizeof(bs), f);
+                if (got == sizeof(bs)) {
+                    if (!gpt_batch_size_valid(bs)) return false;
+                    parsed_resume.batch_size = bs;
+                } else if (got != 0 || ferror(f)) {
+                    return false; // truncated extension
                 }
-                if ((i32)parsed_resume.m.size() != n || used != expected_params) return false;
-                used = 0;
-                parsed_resume.v.reserve(expected.size());
-                for (size_t i = 0; i < expected.size(); ++i) {
-                    Tensor t;
-                    const size_t remaining = (size_t)(expected_params - used);
-                    if (!read_tensor(f, t, expected[i].rows, expected[i].cols, remaining))
-                        return false;
-                    used += (int64_t)t.rows * t.cols;
-                    parsed_resume.v.push_back(std::move(t));
-                }
-                if ((i32)parsed_resume.v.size() != n || used != expected_params) return false;
-                i32 rt = 0;
-                if (!read_i32(f, rt) || !adamw_t_valid(rt)) return false;
-                // A terminal counter is still readable for inference, but an
-                // explicit resume could never take another savable step.
-                if (resume && !adamw_t_can_step(rt)) return false;
-                parsed_resume.t = rt;
-                for (const auto& t : parsed_resume.m)
-                    if (Serialize::has_naninf_tensor(t)) return false;
-                for (const auto& t : parsed_resume.v)
-                    if (Serialize::has_naninf_tensor(t)) return false;
                 return true;
             };
             if (!read_resume()) break;
@@ -735,6 +756,12 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
     GPTResume resumed;
     bool have_resume = false;
     int start_epoch = 0;
+    // On resume the caller's batch_size is an ignored override, just like
+    // dim/blocks/max_len; a fresh run still rejects a nonsense value.
+    if (!do_resume && !gpt_batch_size_valid(tcfg.batch_size)) {
+        printf("ERROR: invalid batch_size %d\n", tcfg.batch_size);
+        return false;
+    }
 
     if (do_resume) {
         // Staged inside read_gpt_checkpoint: a corrupt resume section cannot
@@ -763,6 +790,7 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
     } else {
         shade_srand(42);
     }
+    const i32 batch_size = have_resume ? resumed.batch_size : tcfg.batch_size;
 
     // Text is still needed for training tokens; on resume the tokenizer and
     // architecture come from the checkpoint, never from a freshly built one.
@@ -871,7 +899,7 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
             iters++;
             iters_since_step++;
 
-            if (iters_since_step >= tcfg.batch_size && !finish_step()) return false;
+            if (iters_since_step >= batch_size && !finish_step()) return false;
         }
         if (iters_since_step > 0 && !finish_step()) return false;
 
@@ -901,6 +929,7 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
         out.rand_calls = (i32)g_rand_calls;
         out.has_opt = true;
         out.t = opt.t;
+        out.batch_size = batch_size;
         out.m.reserve(opt.m.size());
         out.v.reserve(opt.v.size());
         for (const auto& mt : opt.m) out.m.emplace_back(mt.rows, mt.cols, mt.data);
