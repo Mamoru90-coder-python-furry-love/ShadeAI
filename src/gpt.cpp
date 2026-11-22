@@ -209,13 +209,21 @@ struct GPT {
         }
         float filtered = keep_top_k(probs, top_k);
         if (filtered > 0) sum = filtered;
+        // top_k zeroes excluded tokens. The cumulative walk can miss every
+        // bucket (rand() may return RAND_MAX, so r == 1.0f, and cum can round
+        // down). Falling back to n-1 could then return an excluded token.
+        // Remember the last kept index without consuming extra RNG.
+        int fallback = n - 1;
+        for (int j = n - 1; j >= 0; j--) {
+            if (probs[j] > 0.0f) { fallback = j; break; }
+        }
         float r = (float)shade_rand() / RAND_MAX;
         float cum = 0;
         for (int j = 0; j < n; j++) {
             cum += probs[j] / sum;
             if (r < cum) return j;
         }
-        return n - 1;
+        return fallback;
     }
 
     bool generate(const std::vector<int>& seed, int max_new_tokens,
