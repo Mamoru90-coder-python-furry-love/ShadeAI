@@ -529,8 +529,7 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
     int64_t budget = 0;
     if (!gpt_config_wire_valid({gpt.vocab_size, gpt.dim, gpt.num_blocks, gpt.max_len},
                                budget) ||
-        tok.vocab_size != gpt.vocab_size ||
-        tok.id2word.size() != (size_t)gpt.vocab_size)
+        tok.vocab_size != gpt.vocab_size || !tok.wire_valid())
         return false;
     // Write to a sibling temp file first. The previous good checkpoint stays
     // untouched until the whole file, INCLUDING its checksum, is on disk and

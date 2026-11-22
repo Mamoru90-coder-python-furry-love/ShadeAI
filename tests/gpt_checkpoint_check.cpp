@@ -35,7 +35,10 @@ int main() {
     const fs::path tokf = dir / "shade_tok.bin";
     const fs::path badcfg = dir / "shade_gpt_badcfg.bin";
     const fs::path badvocab = dir / "shade_gpt_badvocab.bin";
-    for (const auto& p : { ck, bad, tokf, badcfg, badvocab }) fs::remove(p);
+    const fs::path tokdup = dir / "shade_gpt_tokdup.bin";
+    const fs::path tokempty = dir / "shade_gpt_tokempty.bin";
+    for (const auto& p : { ck, bad, tokf, badcfg, badvocab, tokdup, tokempty })
+        fs::remove(p);
 
     bool ok = true;
     auto expect = [&](bool cond, const char* what) {
@@ -368,6 +371,22 @@ int main() {
                "rejected vocab leaves no checkpoint or temp");
     }
 
+    // The tokenizer half of the file needs the same writer/reader symmetry.
+    // Both mutations below write bytes that read() would reject.
+    {
+        Tokenizer dup = tok;
+        dup.id2word[Tokenizer::SPECIAL] = dup.id2word[Tokenizer::SPECIAL + 1];
+        expect(!save_gpt(tokdup.string(), gpt, dup), "save rejects duplicate tokenizer token");
+        expect(!fs::exists(tokdup) && !fs::exists(tokdup.string() + ".tmp"),
+               "rejected duplicate token leaves no checkpoint or temp");
+
+        Tokenizer empty = tok;
+        empty.id2word[Tokenizer::SPECIAL].clear();
+        expect(!save_gpt(tokempty.string(), gpt, empty), "save rejects empty tokenizer token");
+        expect(!fs::exists(tokempty) && !fs::exists(tokempty.string() + ".tmp"),
+               "rejected empty token leaves no checkpoint or temp");
+    }
+
     // ---- atomic save: no leftover temp, and a failed write keeps the old model ----
     expect(!fs::exists(ck.string() + ".tmp"), "no temp file after successful save");
     expect(save_gpt(ck.string(), gpt, tok), "re-save over existing checkpoint");
@@ -383,7 +402,8 @@ int main() {
            "previous checkpoint survives a failed save");
     fs::remove(blocked);
 
-    for (const auto& p : { ck, bad, tokf, badcfg, badvocab }) fs::remove(p);
+    for (const auto& p : { ck, bad, tokf, badcfg, badvocab, tokdup, tokempty })
+        fs::remove(p);
 
     if (!ok) { std::fprintf(stderr, "gpt_checkpoint_check: FAILED\n"); return 1; }
     std::puts("gpt_checkpoint_check: OK");

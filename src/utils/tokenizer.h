@@ -120,6 +120,32 @@ struct Tokenizer {
     static constexpr size_t NODE_AND_BUCKET = 48; // unordered_map estimate
     static constexpr size_t BASE_PER_WORD = 2 * sizeof(std::string) + NODE_AND_BUCKET;
 
+    // The checkpoint writer must not publish a vocabulary that read() rejects.
+    // Mirror its structural checks here, including the default byte budget,
+    // so a directly mutated Tokenizer cannot create an unloadable model.
+    bool wire_valid() const {
+        const size_t n = id2word.size();
+        if (vocab_size < SPECIAL || vocab_size > MAX_WORDS || n != (size_t)vocab_size)
+            return false;
+        if (word2id.size() != n) return false;
+
+        static const char* specials[SPECIAL] = { "<PAD>", "<UNK>", "<BOS>", "<EOS>" };
+        for (i32 i = 0; i < SPECIAL; i++)
+            if (id2word[(size_t)i] != specials[i]) return false;
+
+        size_t used = 0;
+        for (size_t i = 0; i < n; i++) {
+            const std::string& w = id2word[i];
+            if (w.empty() || w.size() > (size_t)MAX_WORD_LEN) return false;
+            const size_t cost = BASE_PER_WORD + 2 * (w.size() + 1);
+            if (cost > MAX_BYTES - used) return false;
+            used += cost;
+            auto it = word2id.find(w);
+            if (it == word2id.end() || it->second != (i32)i) return false;
+        }
+        return true;
+    }
+
     // max_bytes can be tightened by the caller (e.g. a checkpoint reader with
     // its own budget). Nothing is committed to *this until every check passes.
     bool read(FILE* f, size_t max_bytes = MAX_BYTES) {
