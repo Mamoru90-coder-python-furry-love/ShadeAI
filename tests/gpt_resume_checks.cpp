@@ -81,9 +81,10 @@ int main() {
     const fs::path shortened = dir / "shade_gpt_resume_shortened.bin";
     const fs::path arch = dir / "shade_gpt_resume_arch.bin";
     const fs::path maxcalls = dir / "shade_gpt_resume_maxcalls.bin";
+    const fs::path tmaxsave = dir / "shade_gpt_resume_tmaxsave.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls })
+                           shortened, arch, maxcalls, tmaxsave })
         fs::remove(p);
 
     bool ok = true;
@@ -156,7 +157,8 @@ int main() {
                 std::vector<Tensor> w3{ Tensor(1, 1, 123.0f) };
                 GPTResume r3;
                 r3.epoch = 777;
-                const bool r = write_bad() && read_gpt_checkpoint(bad.string(), c3, t3, w3,
+                const bool r = write_all(bad, read_all(full)) && write_bad() &&
+                               read_gpt_checkpoint(bad.string(), c3, t3, w3,
                                                                  Tokenizer::MAX_BYTES, &r3);
                 expect(!r, label);
                 expect(w3.size() == 1 && w3[0].data[0] == 123.0f,
@@ -180,10 +182,24 @@ int main() {
                 return poke_i32(bad, o.first_rows, res.m[0].rows + 1, true);
             });
             rejected("negative t rejected", [&] { return poke_i32(bad, o.t, -1, true); });
+            rejected("t=INT32_MAX rejected", [&] {
+                return poke_i32(bad, o.t, std::numeric_limits<i32>::max(), true);
+            });
             // Truncation of the resume tail.
             rejected("truncated resume section rejected", [&] {
                 auto b = bytes; b.resize(b.size() - 4); return write_all(bad, b);
             });
+
+            // The writer must not publish a counter that the reader rejects.
+            {
+                GPT gmax(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+                auto gp = gmax.params();
+                for (size_t i = 0; i < gp.size(); ++i) gp[i]->data = weights[i].data;
+                GPTResume tmax = res;
+                tmax.t = std::numeric_limits<i32>::max();
+                expect(!save_gpt(tmaxsave.string(), gmax, tok, &tmax),
+                       "save_gpt rejects t=INT32_MAX");
+            }
 
             // ---- 4. sensitivity: zeroing m/v must change the continuation ----
             GPTResume zm = res;
@@ -357,7 +373,7 @@ int main() {
 
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls })
+                           shortened, arch, maxcalls, tmaxsave })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");

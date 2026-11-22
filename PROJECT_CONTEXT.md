@@ -445,6 +445,28 @@ v data.size() 12 vs 8        FAIL (t 0->1)
 
 `tests\gpt_checkpoint_check.cpp` додає блок перевірок для всіх чотирьох меж. Мутаційні контролі: окреме вимкнення guard-ів для `clip_grads`, логітів loss, `sample` і `save_gpt` дає відповідні `FAIL`; після відновлення — `OK`. Верифікація: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E train/infer/resume → `exit=0`.
 
+#### Аудит `CheckpointPair::t` / лічильника кроків (база `4f979a6`)
+
+Негативні контролі на невиправленому коді:
+
+- `AdamW::step` із `t=INT32_MAX` давав `t=-2147483648` і `p=0.99` — адаптивна частина оновлення тихо зникала; із `t=-1` давав `t=0` і `p=-nan(ind)`.
+- `save_optimizer` приймав `t=INT32_MAX` і повертав його назад; `CheckpointPair::publish` публікував generation із таким `t`.
+- `save_gpt` приймав v3 resume з `t=INT32_MAX`, reader його теж приймав. Після одного resume-epoch `opt.t` ставав від'ємним, а наступний reader відхиляв щойно записаний чекпойнт.
+- Забуття `opt.t = res.t` при коректних `m/v` дає розбіжність `worst|dw|=0.0298598` — контракт `Result::t` чутливий, але лишається явним.
+
+Виправлення без зміни формул і без переписування протоколу:
+
+- `src\optimizer\adamw.h`: додано `adamw_t_valid(t)` (`0 <= t < INT32_MAX`); `step()` відхиляє невалідний `t` **до** `t++` і до будь-якої мутації параметрів/моментів.
+- `src\utils\serialize.h`: `save_optimizer`, `read_optimizer_blocks` і `CheckpointPair::publish` використовують той самий helper, тож неможливо опублікувати чи прочитати чекпойнт, який не можна продовжити.
+- `src\gpt.cpp`: `save_gpt` і reader SHDG v3 перевіряють `t` тими ж structural guards, що й `epoch`/`rand_calls`.
+- `CheckpointPair::Result::t` і надалі не призначається автоматично; у `optimizer_resume_checks` додано окремий негативний контроль на забутий `opt.t = res.t`.
+
+Тести: `adamw_contract_checks` додає межі `t`; `optimizer_resume_checks` — відмову `publish`/legacy-sidecar для `t=INT32_MAX` і забутий `res.t`; `gpt_resume_checks` — structural poke `t=INT32_MAX` із перерахованим CRC і відмову `save_gpt`. Кожен structural poke тепер починається з чистої копії чекпойнта — інакше пізніший випадок відхилявся б через попереднє пошкодження, не перевіряючи власний guard.
+
+Мутаційні контролі: вимкнення guard-а в `step()` дає `t=-1→0`, `t=INT32_MAX→INT32_MIN` і `adamw_contract_checks: FAILED`; `adamw_t_valid() → true` ламає `optimizer_resume_checks` і `gpt_resume_checks` (`FAIL` для publish/save/reader на `t=MAX`). Після відновлення — `OK`.
+
+Верифікація після фіксу: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E на `build\shade.exe`: train `exit=0`, inference в3 `exit=0`, resume завершеного чекпойнта `exit=0`.
+
 ### Ще не зроблено
 
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.

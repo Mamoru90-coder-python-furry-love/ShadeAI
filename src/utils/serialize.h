@@ -9,6 +9,7 @@
 #include <windows.h>
 #endif
 #include "../core/tensor.h"
+#include "../optimizer/adamw.h"
 #include <vector>
 #include <string>
 #include <cerrno>
@@ -154,7 +155,7 @@ inline bool read_optimizer_blocks(FILE* f, const std::vector<Tensor*>& m,
         sv.push_back(std::move(x));
     }
     i32 new_t;
-    if (!read_i32(f, new_t) || new_t < 0 || !at_eof(f)) return false;
+    if (!read_i32(f, new_t) || !adamw_t_valid(new_t) || !at_eof(f)) return false;
     t = new_t;
     return true;
 }
@@ -250,7 +251,7 @@ ModelInfo read_model_info(const std::string& path) {
 // one block for m's then one for v's, then the adam step counter t.
 bool save_optimizer(const std::string& path,
                     const std::vector<Tensor*>& m, const std::vector<Tensor*>& v, i32 t) {
-    if (m.size() != v.size() || t < 0) return false;
+    if (m.size() != v.size() || !adamw_t_valid(t)) return false;
     for (auto* p : m) if (has_naninf_tensor(*p)) return false;
     for (auto* p : v) if (has_naninf_tensor(*p)) return false;
 
@@ -372,7 +373,7 @@ struct CheckpointPair {
         const bool has_opt = !m.empty();
         // Check the pair shape unconditionally: v without m is a caller bug,
         // not a legitimate model-only publish.
-        if (m.size() != v.size() || (has_opt && t < 0)) return false;
+        if (m.size() != v.size() || (has_opt && !adamw_t_valid(t))) return false;
 
         const std::string mg = pair_detail::gen_path(model_path, gen);
         const std::string og = pair_detail::gen_path(opt_path, gen);

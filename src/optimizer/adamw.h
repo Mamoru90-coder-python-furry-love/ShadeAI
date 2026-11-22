@@ -1,7 +1,16 @@
 #pragma once
 #include "../core/tensor.h"
 #include "../core/simd.h"
+#include <limits>
 #include <vector>
+
+// t counts completed optimizer steps. step() increments it before computing
+// the bias-correction terms, so INT32_MAX must never be fed back into step():
+// it would wrap to INT32_MIN and silently produce a bogus (or NaN) update.
+// The same bound is used by every checkpoint reader/writer below.
+inline bool adamw_t_valid(i32 t) {
+    return t >= 0 && t < std::numeric_limits<i32>::max();
+}
 
 struct AdamW {
     f32 lr, beta1, beta2, eps, wd;
@@ -45,6 +54,7 @@ struct AdamW {
             if (g->data.size() != want || m[i].data.size() != want ||
                 v[i].data.size() != want) return;
         }
+        if (!adamw_t_valid(t)) return; // no wrap, no negative-step NaN — before any mutation
         t++;
         // bias-correction factors + fused step coefficients — computed ONCE per step
         f32 p1t = std::pow(beta1, t);

@@ -32,9 +32,9 @@ static bool same(const Snap& a, const Snap& b) {
 
 static bool reject_case(const char* name, std::vector<Tensor> p,
                         std::vector<Tensor> g, std::vector<Tensor> m,
-                        std::vector<Tensor> v) {
+                        std::vector<Tensor> v, i32 t0 = 0) {
     AdamW opt(0.1f, 0.1f);
-    opt.m = m; opt.v = v;
+    opt.m = m; opt.v = v; opt.t = t0;
     const Snap before = snapshot(opt, p);
     std::vector<Tensor*> pp, gg;
     for (auto& t : p) pp.push_back(&t);
@@ -50,8 +50,8 @@ static Tensor filled(i32 r, i32 c, f32 v) { return Tensor(r, c, v); }
 int main() {
     bool ok = true;
     auto run = [&](const char* name, std::vector<Tensor> p, std::vector<Tensor> g,
-                   std::vector<Tensor> m, std::vector<Tensor> v) {
-        if (!reject_case(name, p, g, m, v)) ok = false;
+                   std::vector<Tensor> m, std::vector<Tensor> v, i32 t0 = 0) {
+        if (!reject_case(name, p, g, m, v, t0)) ok = false;
     };
 
     std::puts("[vector count mismatches — extras are ignored by old code, never OOB]");
@@ -135,6 +135,19 @@ int main() {
         v[0].data.resize(12);
         run("v data.size() 12 vs 8", { filled(1, 8, 1.0f) }, { filled(1, 8, 1.0f) },
             { filled(1, 8, 0.0f) }, v);
+    }
+
+    std::puts("[step counter bounds — no wrap, no negative-step NaN]");
+    {
+        const i32 imax = std::numeric_limits<i32>::max();
+        const bool bounds = adamw_t_valid(0) && adamw_t_valid(imax - 1) &&
+                            !adamw_t_valid(-1) && !adamw_t_valid(imax);
+        std::printf("  %-38s %s\n", "t range [0, INT32_MAX)", bounds ? "OK" : "FAIL");
+        if (!bounds) ok = false;
+        run("t=-1 is a no-op", { filled(1, 8, 1.0f) }, { filled(1, 8, 0.1f) },
+            { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) }, -1);
+        run("t=INT32_MAX is a no-op", { filled(1, 8, 1.0f) }, { filled(1, 8, 0.1f) },
+            { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) }, imax);
     }
 
     std::puts("[size_t -> i32 guard before step]");

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -80,6 +81,14 @@ static void poke_byte(const fs::path& p, size_t off, unsigned char val) {
     if (!f) return;
     fseek(f, (long)off, SEEK_SET);
     fputc(val, f);
+    fclose(f);
+}
+
+static void poke_i32(const fs::path& p, size_t off, i32 val) {
+    std::FILE* f = fopen(p.string().c_str(), "r+b");
+    if (!f) return;
+    fseek(f, (long)off, SEEK_SET);
+    fwrite(&val, sizeof(val), 1, f);
     fclose(f);
 }
 
@@ -309,6 +318,73 @@ int main() {
                                                    ptrs(p2), ptrs(opt2.m), ptrs(opt2.v));
         expect(!res.valid, "unreadable legacy optimizer rejected");
         fs::remove(o_missing);
+    }
+
+    // 8. The step counter is i32 and step() increments it before use. A
+    //    checkpoint at INT32_MAX must be rejected before it can wrap to a
+    //    negative t and silently poison the next resume.
+    {
+        const i32 imax = std::numeric_limits<i32>::max();
+        const fs::path mp = dir / "shade_resume_tmax_model.bin";
+        const fs::path op = dir / "shade_resume_tmax_opt.bin";
+        clean(mp, op);
+
+        // 8a. publish() refuses an unresumable counter.
+        {
+            auto p = make_params();
+            std::vector<Tensor> g;
+            for (auto& t : p) g.emplace_back(t.rows, t.cols);
+            AdamW opt(0.05f, 0.1f);
+            for (auto* q : ptrs(p)) opt.add(*q);
+            expect(!Serialize::CheckpointPair::publish(mp.string(), op.string(), ptrs(p),
+                                                       4, 2, 16, ptrs(opt.m), ptrs(opt.v), imax),
+                   "publish rejects t=INT32_MAX");
+        }
+
+        // 8b. A legacy sidecar whose trailing t was poked to INT32_MAX is a hard
+        //     failure; no weight or moment may be committed.
+        {
+            auto p = make_params();
+            std::vector<Tensor> g;
+            for (auto& t : p) g.emplace_back(t.rows, t.cols);
+            AdamW opt(0.05f, 0.1f);
+            for (auto* q : ptrs(p)) opt.add(*q);
+            for (int s = 1; s <= 4; s++) step_all(p, opt, g, s);
+            expect(Serialize::save_model(mp.string(), ptrs(p), 4, 2, 16), "tmax model save");
+            expect(Serialize::save_optimizer(op.string(), ptrs(opt.m), ptrs(opt.v), opt.t),
+                   "tmax optimizer save");
+            poke_i32(op, fs::file_size(op) - sizeof(imax), imax);
+
+            auto p2 = make_params();
+            std::vector<Tensor> g2;
+            AdamW opt2(0.05f, 0.1f);
+            for (auto* q : ptrs(p2)) opt2.add(*q);
+            const f32 before = p2[0].data[0];
+            auto res = Serialize::CheckpointPair::load(mp.string(), op.string(),
+                                                       ptrs(p2), ptrs(opt2.m), ptrs(opt2.v));
+            expect(!res.valid, "legacy sidecar t=INT32_MAX rejected");
+            expect(p2[0].data[0] == before && opt2.t == 0,
+                   "t=INT32_MAX sidecar commits nothing");
+        }
+
+        // 8c. Negative control for the documented caller contract: correct m/v
+        //     but forgetting `opt.t = res.t` must still diverge.
+        {
+            auto p = make_params();
+            std::vector<Tensor> g;
+            for (auto& t : p) g.emplace_back(t.rows, t.cols);
+            AdamW opt(0.05f, 0.1f);
+            for (auto* q : ptrs(p)) opt.add(*q);
+            auto res = Serialize::CheckpointPair::load(m_r.string(), o_r.string(),
+                                                       ptrs(p), ptrs(opt.m), ptrs(opt.v));
+            expect(res.valid && res.has_opt && res.t == 4, "control pair still readable");
+            // DELIBERATELY omit opt.t = res.t.
+            for (int s = 5; s <= 10; s++) step_all(p, opt, g, s);
+            double worst = 0.0;
+            expect(!same_params(p, pref, &worst), "forgetting res.t diverges (negative control)");
+            std::printf("  forgotten t worst |diff|=%.6g\n", worst);
+        }
+        clean(mp, op);
     }
 
     for (auto pr : { std::make_pair(m_cont, o_r), std::make_pair(m_r, o_r),

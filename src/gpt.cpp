@@ -526,7 +526,8 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
     // published, and so the CRC always covers the exact bytes we intend.
     if (resume && ok) {
         if (resume->epoch < 0 || resume->rand_seed < 0 ||
-            resume->rand_calls < 0 || resume->rand_calls > GPT_MAX_RAND_REPLAY)
+            resume->rand_calls < 0 || resume->rand_calls > GPT_MAX_RAND_REPLAY ||
+            !adamw_t_valid(resume->t))
             ok = false;
         if (resume->has_opt) {
             if (resume->m.size() != params.size() || resume->v.size() != params.size())
@@ -678,7 +679,7 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                 }
                 if ((i32)parsed_resume.v.size() != n || used != expected_params) return false;
                 i32 rt = 0;
-                if (!read_i32(f, rt) || rt < 0) return false;
+                if (!read_i32(f, rt) || !adamw_t_valid(rt)) return false;
                 parsed_resume.t = rt;
                 for (const auto& t : parsed_resume.m)
                     if (Serialize::has_naninf_tensor(t)) return false;
