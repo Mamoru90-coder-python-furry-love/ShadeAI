@@ -454,6 +454,17 @@ static bool gpt_config_budget(const GPTConfig& c, int64_t& out_params) {
     return true;
 }
 
+// One wire-format contract for BOTH sides: the reader rejects these shapes
+// before building a model, so the writer and a fresh train_gpt must reject the
+// same values instead of publishing a checkpoint that cannot be loaded.
+static bool gpt_config_wire_valid(const GPTConfig& c, int64_t& out_params) {
+    if (c.vocab < Tokenizer::SPECIAL || c.vocab > 1000000) return false;
+    if (c.dim < 1 || c.dim > 65536) return false;
+    if (c.blocks < 1 || c.blocks > 1024) return false;
+    if (c.max_len < 1 || c.max_len > 1000000) return false;
+    return gpt_config_budget(c, out_params);
+}
+
 // ---- checkpoint integrity: CRC-32 (IEEE 802.3, reflected poly 0xEDB88320) ----
 // Detects accidental corruption, NOT deliberate tampering. Init 0xFFFFFFFF,
 // final XOR 0xFFFFFFFF. The table is generated once, no external dependency.
@@ -510,10 +521,17 @@ static bool gpt_compute_file_crc(FILE* f, uint32_t& out) {
 bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
               const GPTResume* resume = nullptr) {
     using namespace Serialize::detail;
-    // The reader rejects poisoned weights; refuse them here too so save_gpt
-    // cannot publish a checkpoint that its own loader would discard.
+    // The reader rejects poisoned weights AND out-of-contract configurations;
+    // refuse them here too so save_gpt cannot publish a checkpoint that its
+    // own loader would discard.
     for (auto* p : gpt.params())
         if (Serialize::has_naninf_tensor(*p)) return false;
+    int64_t budget = 0;
+    if (!gpt_config_wire_valid({gpt.vocab_size, gpt.dim, gpt.num_blocks, gpt.max_len},
+                               budget) ||
+        tok.vocab_size != gpt.vocab_size ||
+        tok.id2word.size() != (size_t)gpt.vocab_size)
+        return false;
     // Write to a sibling temp file first. The previous good checkpoint stays
     // untouched until the whole file, INCLUDING its checksum, is on disk and
     // the atomic rename succeeds.
@@ -628,15 +646,10 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
         // 7: config, tokenizer, tensor shapes/count, all before staging data.
         if (!read_i32(f, parsed.vocab) || !read_i32(f, parsed.dim) ||
             !read_i32(f, parsed.blocks) || !read_i32(f, parsed.max_len)) break;
-        if (parsed.vocab < Tokenizer::SPECIAL || parsed.vocab > 1000000) break;
-        if (parsed.dim < 1 || parsed.dim > 65536) break;
-        if (parsed.blocks < 1 || parsed.blocks > 1024) break;
-        if (parsed.max_len < 1 || parsed.max_len > 1000000) break;
-
         // Reject the whole architecture before infer_gpt() constructs it:
         // params + gradients + caches + activations, not just file size.
         int64_t expected_params = 0;
-        if (!gpt_config_budget(parsed, expected_params)) break;
+        if (!gpt_config_wire_valid(parsed, expected_params)) break;
         const auto expected = gpt_expected_shapes(parsed);
 
         if (!parsed_tok.read(f, max_tokenizer_bytes) || parsed_tok.vocab_size != parsed.vocab) break;
@@ -818,6 +831,12 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
     if (!have_resume) {
         tok.build(text, 2000);
         cfg = { tok.vocab_size, tcfg.dim, tcfg.blocks, tcfg.max_len };
+        int64_t budget = 0;
+        if (!gpt_config_wire_valid(cfg, budget)) {
+            printf("ERROR: invalid architecture vocab=%d dim=%d blocks=%d ctx=%d\n",
+                   cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+            return false;
+        }
     } else if ((i32)tok.vocab_size != cfg.vocab) {
         printf("ERROR: restored tokenizer vocab %d != checkpoint vocab %d\n",
                tok.vocab_size, cfg.vocab);

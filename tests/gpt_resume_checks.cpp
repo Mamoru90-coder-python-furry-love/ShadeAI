@@ -91,10 +91,11 @@ int main() {
     const fs::path badfresh = dir / "shade_gpt_resume_badfresh.bin";
     const fs::path rngbig = dir / "shade_gpt_resume_rngbig.bin";
     const fs::path rngbad = dir / "shade_gpt_resume_rngbad.bin";
+    const fs::path badcfg = dir / "shade_gpt_resume_badcfg.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh, rngbig, rngbad })
+                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg })
         fs::remove(p);
 
     bool ok = true;
@@ -267,6 +268,23 @@ int main() {
                 invalid.batch_size = 0;
                 expect(!train_gpt(data.string(), badfresh.string(), false, invalid),
                        "fresh run rejects batch_size=0");
+
+                // The same wire contract must be enforced before a fresh model
+                // is built: blocks=0 used to publish an unreadable checkpoint,
+                // and dim=15 used to throw out of main instead of returning.
+                GPTTrainConfig no_blocks = small;
+                no_blocks.blocks = 0;
+                fs::remove(badcfg);
+                expect(!train_gpt(data.string(), badcfg.string(), false, no_blocks),
+                       "fresh run rejects blocks=0");
+                expect(!fs::exists(badcfg), "invalid architecture leaves no checkpoint");
+
+                GPTTrainConfig bad_dim = small;
+                bad_dim.dim = 15;
+                fs::remove(badcfg);
+                expect(!train_gpt(data.string(), badcfg.string(), false, bad_dim),
+                       "fresh run rejects dim not divisible by 4");
+                expect(!fs::exists(badcfg), "invalid dim leaves no checkpoint");
             }
 
             // A v3 file written before the trailing field ended after t. It is
@@ -483,7 +501,7 @@ int main() {
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh, rngbig, rngbad })
+                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");

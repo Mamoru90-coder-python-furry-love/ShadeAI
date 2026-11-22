@@ -33,7 +33,9 @@ int main() {
     const fs::path ck = dir / "shade_gpt_ck.bin";
     const fs::path bad = dir / "shade_gpt_bad.bin";
     const fs::path tokf = dir / "shade_tok.bin";
-    for (const auto& p : { ck, bad, tokf }) fs::remove(p);
+    const fs::path badcfg = dir / "shade_gpt_badcfg.bin";
+    const fs::path badvocab = dir / "shade_gpt_badvocab.bin";
+    for (const auto& p : { ck, bad, tokf, badcfg, badvocab }) fs::remove(p);
 
     bool ok = true;
     auto expect = [&](bool cond, const char* what) {
@@ -350,6 +352,22 @@ int main() {
     expect(write_all(bad, tokbytes) && !tok3.load(bad.string()),
            "corrupt special token in tokenizer file rejected");
 
+    // Writer/reader symmetry: a configuration the reader rejects must never be
+    // published. Both cases construct a live GPT, so only the writer guard
+    // stands between them and an unloadable checkpoint.
+    {
+        GPT zero_blocks(tok.vocab_size, 8, 0, 4);
+        expect(!save_gpt(badcfg.string(), zero_blocks, tok), "save rejects blocks=0");
+        expect(!fs::exists(badcfg) && !fs::exists(badcfg.string() + ".tmp"),
+               "rejected config leaves no checkpoint or temp");
+
+        GPT wrong_vocab(tok.vocab_size + 1, 8, 1, 4);
+        expect(!save_gpt(badvocab.string(), wrong_vocab, tok),
+               "save rejects config/tokenizer vocab mismatch");
+        expect(!fs::exists(badvocab) && !fs::exists(badvocab.string() + ".tmp"),
+               "rejected vocab leaves no checkpoint or temp");
+    }
+
     // ---- atomic save: no leftover temp, and a failed write keeps the old model ----
     expect(!fs::exists(ck.string() + ".tmp"), "no temp file after successful save");
     expect(save_gpt(ck.string(), gpt, tok), "re-save over existing checkpoint");
@@ -365,7 +383,7 @@ int main() {
            "previous checkpoint survives a failed save");
     fs::remove(blocked);
 
-    for (const auto& p : { ck, bad, tokf }) fs::remove(p);
+    for (const auto& p : { ck, bad, tokf, badcfg, badvocab }) fs::remove(p);
 
     if (!ok) { std::fprintf(stderr, "gpt_checkpoint_check: FAILED\n"); return 1; }
     std::puts("gpt_checkpoint_check: OK");
