@@ -33,6 +33,17 @@
 // exact call count; resume then replays that many calls and continues with the
 // identical shuffle and sampling stream. Fresh-run behaviour is untouched.
 static constexpr i32 GPT_MAX_RAND_REPLAY = 100000000;
+// A run may consume far more rand() calls than we are willing to replay from
+// a hostile checkpoint. Storing the true counter must keep working so a long
+// run can still publish a checkpoint; such a file is terminal for training
+// resume but stays readable for inference.
+static constexpr i32 GPT_MAX_RAND_STORED = std::numeric_limits<i32>::max();
+static inline bool gpt_rand_calls_valid(i32 calls) {
+    return calls >= 0 && calls <= GPT_MAX_RAND_STORED;
+}
+static inline bool gpt_rand_calls_replayable(i32 calls) {
+    return calls >= 0 && calls <= GPT_MAX_RAND_REPLAY;
+}
 static i32 g_rand_seed = 42;
 static int64_t g_rand_calls = 0;
 static int shade_rand() { ++g_rand_calls; return rand(); }
@@ -46,7 +57,7 @@ static void shade_srand(i32 seed) {
 // BEFORE building the model and replay only after construction. That reproduces
 // seed -> construction -> training exactly, without counting every header.
 static void shade_replay_rand(i32 calls) {
-    if (calls < 0 || calls > GPT_MAX_RAND_REPLAY) return; // caller validated
+    if (!gpt_rand_calls_replayable(calls)) return; // caller validated
     for (i32 i = 0; i < calls; ++i) { (void)rand(); ++g_rand_calls; }
 }
 
@@ -535,7 +546,7 @@ bool save_gpt(const std::string& path, GPT& gpt, const Tokenizer& tok,
     // published, and so the CRC always covers the exact bytes we intend.
     if (resume && ok) {
         if (resume->epoch < 0 || resume->rand_seed < 0 ||
-            resume->rand_calls < 0 || resume->rand_calls > GPT_MAX_RAND_REPLAY ||
+            !gpt_rand_calls_valid(resume->rand_calls) ||
             !adamw_t_valid(resume->t) || !gpt_batch_size_valid(resume->batch_size))
             ok = false;
         if (resume->has_opt) {
@@ -650,13 +661,16 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                 i32 epoch = 0, seed = 0, calls = 0, has_opt = 0;
                 if (!read_i32(f, epoch) || !read_i32(f, seed) ||
                     !read_i32(f, calls) || !read_i32(f, has_opt)) return false;
-                if (epoch < 0 || seed < 0 || calls < 0 ||
-                    calls > GPT_MAX_RAND_REPLAY || (has_opt != 0 && has_opt != 1))
+                if (epoch < 0 || seed < 0 || !gpt_rand_calls_valid(calls) ||
+                    (has_opt != 0 && has_opt != 1))
                     return false;
                 // A checkpoint without optimizer moments is usable for inference,
                 // but an explicit resume must fail here: train_gpt needs m/v/t
                 // to continue the same optimization trajectory.
                 if (!has_opt && resume) return false;
+                // Stored ranges are broader than replayable ones: a terminal
+                // checkpoint is still readable, but cannot start another epoch.
+                if (resume && !gpt_rand_calls_replayable(calls)) return false;
                 parsed_resume.epoch = epoch;
                 parsed_resume.rand_seed = seed;
                 parsed_resume.rand_calls = calls;
@@ -926,6 +940,10 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
         GPTResume out;
         out.epoch = ep + 1;
         out.rand_seed = g_rand_seed;
+        if (g_rand_calls > GPT_MAX_RAND_STORED) {
+            printf("ERROR: rand call counter exhausted at epoch %d\n", ep);
+            return false;
+        }
         out.rand_calls = (i32)g_rand_calls;
         out.has_opt = true;
         out.t = opt.t;

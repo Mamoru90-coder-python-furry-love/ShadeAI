@@ -89,10 +89,12 @@ int main() {
     const fs::path legacybs = dir / "shade_gpt_resume_legacybs.bin";
     const fs::path badbs = dir / "shade_gpt_resume_badbs.bin";
     const fs::path badfresh = dir / "shade_gpt_resume_badfresh.bin";
+    const fs::path rngbig = dir / "shade_gpt_resume_rngbig.bin";
+    const fs::path rngbad = dir / "shade_gpt_resume_rngbad.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh })
+                           legacybs, badbs, badfresh, rngbig, rngbad })
         fs::remove(p);
 
     bool ok = true;
@@ -437,12 +439,14 @@ int main() {
                "checkpoint architecture survives caller override");
     }
 
-    // rand_calls is bounded on read. The boundary itself is structurally valid;
-    // replaying it is not exercised here (it would burn 100M CRT calls).
+    // Stored and replayable ranges are separate. The 100M boundary is still
+    // resumeable at the reader level; actually replaying it is left to the
+    // standalone control because it costs ~2s.
     {
         GPT g(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
         auto pp = g.params();
         for (size_t i = 0; i < pp.size(); ++i) pp[i]->data = weights[i].data;
+
         GPTResume maxr = res;
         maxr.rand_calls = GPT_MAX_RAND_REPLAY;
         expect(save_gpt(maxcalls.string(), g, tok, &maxr), "write max rand_calls checkpoint");
@@ -451,12 +455,35 @@ int main() {
                                    Tokenizer::MAX_BYTES, &r) &&
                r.rand_calls == GPT_MAX_RAND_REPLAY,
                "rand_calls boundary accepted by reader");
+        GPTResume rr;
+        expect(read_gpt_checkpoint(maxcalls.string(), c, t, w,
+                                   Tokenizer::MAX_BYTES, &rr),
+               "rand_calls boundary accepted for explicit resume");
+
+        // A long run beyond the replay budget must still be able to publish a
+        // checkpoint; that file is terminal for training but readable for
+        // inference.
+        GPTResume big = res;
+        big.rand_calls = GPT_MAX_RAND_REPLAY + 1;
+        expect(save_gpt(rngbig.string(), g, tok, &big),
+               "save_gpt stores rand_calls past replay budget");
+        GPTConfig cb{}; Tokenizer tb2; std::vector<Tensor> wb; GPTResume rb;
+        expect(read_gpt_checkpoint(rngbig.string(), cb, tb2, wb),
+               "past-budget checkpoint readable for inference");
+        expect(!read_gpt_checkpoint(rngbig.string(), cb, tb2, wb,
+                                    Tokenizer::MAX_BYTES, &rb),
+               "explicit resume rejects past replay budget");
+
+        GPTResume bad = res;
+        bad.rand_calls = -1;
+        expect(!save_gpt(rngbad.string(), g, tok, &bad),
+               "save_gpt rejects negative rand_calls");
     }
 
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh })
+                           legacybs, badbs, badfresh, rngbig, rngbad })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");
