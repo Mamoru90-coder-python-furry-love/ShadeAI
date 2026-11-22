@@ -453,6 +453,28 @@ int main() {
     expect(!Serialize::load(plain.string(), plain_dst), "poisoned plain rejected");
     expect(plain_x.data[0] == -7.0f && plain_y.data[0] == -7.0f, "plain failure leaves tensors unchanged");
 
+    // Tensor::data is public: a resized payload must be refused before any
+    // header byte is written, otherwise the reader rejects the whole file.
+    {
+        fs::remove(bad);
+        FILE* f = std::fopen(bad.string().c_str(), "w+b");
+        expect(f != nullptr, "open tensor shape probe");
+        if (f) {
+            Tensor shorty(2, 3), longy(2, 3);
+            fill(shorty, 1.0f); fill(longy, 1.0f);
+            shorty.data.pop_back();
+            longy.data.push_back(2.0f);
+            expect(!Serialize::detail::write_tensor(f, shorty),
+                   "write_tensor rejects short payload");
+            expect(!Serialize::detail::write_tensor(f, longy),
+                   "write_tensor rejects oversized payload");
+            expect(std::fclose(f) == 0, "close tensor shape probe");
+        }
+        expect(fs::exists(bad) && fs::file_size(bad) == 0,
+               "rejected tensor writes no header bytes");
+        fs::remove(bad);
+    }
+
     // Optimizer state: truncation must not change m, v or t.
     Tensor m0(2, 3), v0(2, 3), m1(1, 4), v1(1, 4);
     for (i32 i = 0; i < m0.size(); i++) { m0.data[i] = 0.1f * i; v0.data[i] = 0.01f * i; }

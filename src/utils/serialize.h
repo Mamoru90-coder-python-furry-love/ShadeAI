@@ -72,8 +72,13 @@ inline bool read_tensor(FILE* f, Tensor& out, i32 expected_rows = -1, i32 expect
 }
 
 inline bool write_tensor(FILE* f, const Tensor& t) {
+    // Tensor::data is public, so rows/cols can drift from the payload. Refuse
+    // that before writing anything: the reader derives its byte count from the
+    // header and would reject a short (or misinterpret an oversized) block.
+    if (!f || !valid_shape(t.rows, t.cols)) return false;
+    if (t.data.size() != (size_t)t.rows * (size_t)t.cols) return false;
     return write_i32(f, t.rows) && write_i32(f, t.cols)
-        && write_exact(f, t.data.data(), (size_t)t.size() * sizeof(f32));
+        && write_exact(f, t.data.data(), t.data.size() * sizeof(f32));
 }
 
 // Reject both truncation and trailing garbage after the expected payload.

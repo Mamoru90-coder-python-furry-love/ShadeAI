@@ -557,6 +557,18 @@ Reader мав повний контракт формату (діапазони `
 
 Верифікація після фіксу: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E train/infer/resume → `0/0/0`.
 
+#### Аудит `write_tensor` і розсинхрону payload (база `04b44b0`)
+
+Негативний контроль на невиправленому коді: `params[0]->data.pop_back()` після побудови `GPT`, потім `save_gpt` → `saved=1 reader=0 file=1`. Writer писав заголовок `rows/cols`, але довжину блоку брав із `data.size()`, тоді як reader обчислює її з заголовка. CRC був валідним, файл — непридатним.
+
+`Tensor::data` публічний, і в `tensor.h` це прямо зазначено; отже перевірка має бути на межі серіалізації, як це вже зроблено для NaN/Inf і конфігурації.
+
+Фікс у `Serialize::detail::write_tensor()`: до будь-якого запису перевіряються `valid_shape(rows, cols)` і `data.size() == rows * cols`. Це закриває і ваги, і моменти resume-секції, бо обидва блоки пишуться через цю функцію. Формат файлу й читач не змінюються.
+
+Тести в `serialize_checks`: короткий і наддовгий payload відхиляються, а файл лишається нульової довжини (жодних часткових заголовків). Мутаційний контроль із прибраними guard-ами дає три `FAIL`; після відновлення — `All tests passed.`
+
+Верифікація після фіксу: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E train/infer/resume → `0/0/0`; окремий харнес тепер дає `saved=0 file=0`.
+
 ### Ще не зроблено
 
 - `train_config.json` не читається `gpt.cpp` — конфіг зашитий у коді.
