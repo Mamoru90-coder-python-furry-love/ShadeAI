@@ -907,7 +907,11 @@ bool train_gpt(const std::string& data_path, const std::string& model_path,
 
         // Shuffle data order
         std::vector<int> indices;
-        for (size_t i = 0; i + seq_len + 1 < data.size(); i += seq_len / 2)
+        // seq_len/2 is the overlap step for normal contexts, but it is zero
+        // for max_len=1. Without a floor the loop never advances and grows
+        // `indices` until the process dies; a one-token context uses step 1.
+        const size_t stride = seq_len > 1 ? (size_t)(seq_len / 2) : 1;
+        for (size_t i = 0; i + seq_len + 1 < data.size(); i += stride)
             indices.push_back((int)i);
         for (int i = (int)indices.size() - 1; i > 0; i--)
             std::swap(indices[i], indices[shade_rand() % (i + 1)]);

@@ -92,10 +92,11 @@ int main() {
     const fs::path rngbig = dir / "shade_gpt_resume_rngbig.bin";
     const fs::path rngbad = dir / "shade_gpt_resume_rngbad.bin";
     const fs::path badcfg = dir / "shade_gpt_resume_badcfg.bin";
+    const fs::path maxlen1 = dir / "shade_gpt_resume_maxlen1.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg })
+                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg, maxlen1 })
         fs::remove(p);
 
     bool ok = true;
@@ -285,6 +286,21 @@ int main() {
                 expect(!train_gpt(data.string(), badcfg.string(), false, bad_dim),
                        "fresh run rejects dim not divisible by 4");
                 expect(!fs::exists(badcfg), "invalid dim leaves no checkpoint");
+            }
+
+            // max_len=1 is a legal one-token context. seq_len/2 was zero here,
+            // so the shuffle loop never advanced and grew `indices` forever.
+            {
+                GPTTrainConfig one = small;
+                one.max_len = 1;
+                one.epochs = 1;
+                expect(train_gpt(data.string(), maxlen1.string(), false, one),
+                       "fresh run with max_len=1 completes");
+                GPTConfig c1{}; Tokenizer t1; std::vector<Tensor> w1; GPTResume r1;
+                expect(read_gpt_checkpoint(maxlen1.string(), c1, t1, w1,
+                                           Tokenizer::MAX_BYTES, &r1) &&
+                       c1.max_len == 1,
+                       "max_len=1 checkpoint is readable");
             }
 
             // A v3 file written before the trailing field ended after t. It is
@@ -501,7 +517,7 @@ int main() {
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
                            shortened, arch, maxcalls, tmaxsave, nearmax, otherbs,
-                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg })
+                           legacybs, badbs, badfresh, rngbig, rngbad, badcfg, maxlen1 })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");
