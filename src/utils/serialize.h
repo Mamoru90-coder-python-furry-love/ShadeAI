@@ -455,6 +455,10 @@ struct CheckpointPair {
                         return bad;
                     }
                     fclose(fo);
+                    // CheckpointPair::load is the training-resume API: a
+                    // storable but terminal t cannot produce another savable
+                    // step, so refuse it before committing any tensor.
+                    if (!adamw_t_can_step(t)) return bad;
                     has_opt = true;
                 }
             }
@@ -484,6 +488,7 @@ struct CheckpointPair {
             const bool ok = detail::read_optimizer_blocks(f, m, v, t, sm, sv);
             fclose(f);
             if (!ok) return bad;
+            if (!adamw_t_can_step(t)) return bad;
         }
 
         detail::commit(sp, params);

@@ -456,9 +456,9 @@ v data.size() 12 vs 8        FAIL (t 0->1)
 
 Виправлення без зміни формул і без переписування протоколу:
 
-- `src\optimizer\adamw.h`: додано `adamw_t_valid(t)` (`0 <= t < INT32_MAX`); `step()` відхиляє невалідний `t` **до** `t++` і до будь-якої мутації параметрів/моментів.
-- `src\utils\serialize.h`: `save_optimizer`, `read_optimizer_blocks` і `CheckpointPair::publish` використовують той самий helper, тож неможливо опублікувати чи прочитати чекпойнт, який не можна продовжити.
-- `src\gpt.cpp`: `save_gpt` і reader SHDG v3 перевіряють `t` тими ж structural guards, що й `epoch`/`rand_calls`.
+- `src\optimizer\adamw.h`: додано два діапазони — `adamw_t_valid()` (`0 <= t < INT32_MAX`, збережуване значення) і `adamw_t_can_step()` (`0 <= t < INT32_MAX - 1`, стан, з якого можна зробити ще один крок). `step()` перевіряє другий **до** `t++` і до будь-якої мутації параметрів/моментів.
+- `src\utils\serialize.h`: `save_optimizer`, `read_optimizer_blocks` і `CheckpointPair::publish` використовують `adamw_t_valid()`; `CheckpointPair::load` як API навчального resume додатково вимагає `adamw_t_can_step()`.
+- `src\gpt.cpp`: `save_gpt` і reader SHDG v3 перевіряють збережуваність; reader з явним `resume` додатково відхиляє термінальний `t`, який не можна продовжити.
 - `CheckpointPair::Result::t` і надалі не призначається автоматично; у `optimizer_resume_checks` додано окремий негативний контроль на забутий `opt.t = res.t`.
 
 Тести: `adamw_contract_checks` додає межі `t`; `optimizer_resume_checks` — відмову `publish`/legacy-sidecar для `t=INT32_MAX` і забутий `res.t`; `gpt_resume_checks` — structural poke `t=INT32_MAX` із перерахованим CRC і відмову `save_gpt`. Кожен structural poke тепер починається з чистої копії чекпойнта — інакше пізніший випадок відхилявся б через попереднє пошкодження, не перевіряючи власний guard.
@@ -466,6 +466,14 @@ v data.size() 12 vs 8        FAIL (t 0->1)
 Мутаційні контролі: вимкнення guard-а в `step()` дає `t=-1→0`, `t=INT32_MAX→INT32_MIN` і `adamw_contract_checks: FAILED`; `adamw_t_valid() → true` ламає `optimizer_resume_checks` і `gpt_resume_checks` (`FAIL` для publish/save/reader на `t=MAX`). Після відновлення — `OK`.
 
 Верифікація після фіксу: `build\test.bat` → `All tests passed.`; `build\compile.bat` → `exit=0`; E2E на `build\shade.exe`: train `exit=0`, inference в3 `exit=0`, resume завершеного чекпойнта `exit=0`.
+
+##### Допрацювання після аудиту `e5bafb6` (прийнята база лишається `4f979a6`)
+
+Негативний контроль на невиправленому `e5bafb6`: `AdamW::step` із `t=INT32_MAX-1` змінював параметри й моменти, але лишав `t=INT32_MAX`, який тоді відхиляли `save_optimizer`/`save_gpt`. Водночас SHDG v3 із `t=INT32_MAX-1` приймався явним resume, хоча жоден наступний крок не міг би зберегти результат.
+
+Рішення — розділити два контракти замість одного guard-а: збережуване значення (`adamw_t_valid`) і вхід для наступного кроку (`adamw_t_can_step`). `step()` відхиляє `INT32_MAX-1` до мутацій; `publish`/`save_gpt`/reader без явного resume лишають термінальний стан читаним для inference; `CheckpointPair::load` і SHDG reader із явним `resume` його відхиляють. Останній дозволений крок із `INT32_MAX-2` лишає `t=INT32_MAX-1`, який усе ще можна зберегти.
+
+Тести додають: `t=INT32_MAX-1` як no-op у `adamw_contract_checks`, контроль «останній крок лишає збережуване t», publish/raw-sidecar для термінального `t` і відмову `CheckpointPair::load`, а для SHDG v3 — успішний запис/читання для inference разом із відмовою явного resume.
 
 ### Ще не зроблено
 

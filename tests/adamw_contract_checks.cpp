@@ -137,17 +137,34 @@ int main() {
             { filled(1, 8, 0.0f) }, v);
     }
 
-    std::puts("[step counter bounds — no wrap, no negative-step NaN]");
+    std::puts("[step counter bounds — storable vs steppable]");
     {
         const i32 imax = std::numeric_limits<i32>::max();
         const bool bounds = adamw_t_valid(0) && adamw_t_valid(imax - 1) &&
-                            !adamw_t_valid(-1) && !adamw_t_valid(imax);
-        std::printf("  %-38s %s\n", "t range [0, INT32_MAX)", bounds ? "OK" : "FAIL");
+                            !adamw_t_valid(-1) && !adamw_t_valid(imax) &&
+                            adamw_t_can_step(0) && adamw_t_can_step(imax - 2) &&
+                            !adamw_t_can_step(imax - 1) && !adamw_t_can_step(imax);
+        std::printf("  %-38s %s\n", "store [0,MAX), step [0,MAX-1)", bounds ? "OK" : "FAIL");
         if (!bounds) ok = false;
         run("t=-1 is a no-op", { filled(1, 8, 1.0f) }, { filled(1, 8, 0.1f) },
             { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) }, -1);
+        run("t=INT32_MAX-1 is a no-op", { filled(1, 8, 1.0f) }, { filled(1, 8, 0.1f) },
+            { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) }, imax - 1);
         run("t=INT32_MAX is a no-op", { filled(1, 8, 1.0f) }, { filled(1, 8, 0.1f) },
             { filled(1, 8, 0.0f) }, { filled(1, 8, 0.0f) }, imax);
+
+        // The last permitted step must still leave a state that can be saved.
+        std::vector<Tensor> p{ filled(1, 8, 1.0f) }, g{ filled(1, 8, 0.1f) };
+        AdamW opt(0.1f, 0.1f);
+        opt.add(p[0]);
+        opt.t = imax - 2;
+        const f32 before_p = p[0].data[0];
+        opt.step({ &p[0] }, { &g[0] });
+        const bool last_step_ok = p[0].data[0] != before_p && opt.t == imax - 1 &&
+                                  adamw_t_valid(opt.t) && !adamw_t_can_step(opt.t);
+        std::printf("  %-38s %s (t=%d, storable=%d)\n", "last step leaves storable state",
+                    last_step_ok ? "OK" : "FAIL", opt.t, adamw_t_valid(opt.t));
+        if (!last_step_ok) ok = false;
     }
 
     std::puts("[size_t -> i32 guard before step]");

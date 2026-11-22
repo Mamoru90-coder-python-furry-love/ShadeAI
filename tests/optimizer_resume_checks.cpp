@@ -384,6 +384,40 @@ int main() {
             expect(!same_params(p, pref, &worst), "forgetting res.t diverges (negative control)");
             std::printf("  forgotten t worst |diff|=%.6g\n", worst);
         }
+
+        // 8d. A terminal counter is storable but not resumable. publish() and
+        //     the raw sidecar must still round-trip it; the training-oriented
+        //     CheckpointPair::load must refuse it before committing anything.
+        {
+            clean(mp, op);
+            auto p = make_params();
+            std::vector<Tensor> g;
+            for (auto& t : p) g.emplace_back(t.rows, t.cols);
+            AdamW opt(0.05f, 0.1f);
+            for (auto* q : ptrs(p)) opt.add(*q);
+            expect(Serialize::CheckpointPair::publish(mp.string(), op.string(), ptrs(p),
+                                                       4, 2, 16, ptrs(opt.m), ptrs(opt.v), imax - 1),
+                   "publish stores terminal t=INT32_MAX-1");
+
+            auto p2 = make_params();
+            AdamW opt2(0.05f, 0.1f);
+            for (auto* q : ptrs(p2)) opt2.add(*q);
+            const f32 before = p2[0].data[0];
+            auto res = Serialize::CheckpointPair::load(mp.string(), op.string(),
+                                                       ptrs(p2), ptrs(opt2.m), ptrs(opt2.v));
+            expect(!res.valid, "CheckpointPair::load rejects terminal t");
+            expect(p2[0].data[0] == before && opt2.t == 0,
+                   "terminal checkpoint commits nothing");
+
+            expect(Serialize::save_optimizer(op.string(), ptrs(opt.m), ptrs(opt.v), imax - 1),
+                   "raw sidecar stores terminal t");
+            std::vector<Tensor> rm, rv;
+            for (auto& q : opt.m) rm.emplace_back(q.rows, q.cols);
+            for (auto& q : opt.v) rv.emplace_back(q.rows, q.cols);
+            i32 rt = -1;
+            expect(Serialize::load_optimizer(op.string(), ptrs(rm), ptrs(rv), rt) &&
+                   rt == imax - 1, "raw sidecar reads terminal t");
+        }
         clean(mp, op);
     }
 

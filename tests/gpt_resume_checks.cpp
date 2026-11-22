@@ -82,9 +82,10 @@ int main() {
     const fs::path arch = dir / "shade_gpt_resume_arch.bin";
     const fs::path maxcalls = dir / "shade_gpt_resume_maxcalls.bin";
     const fs::path tmaxsave = dir / "shade_gpt_resume_tmaxsave.bin";
+    const fs::path nearmax = dir / "shade_gpt_resume_nearmax.bin";
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls, tmaxsave })
+                           shortened, arch, maxcalls, tmaxsave, nearmax })
         fs::remove(p);
 
     bool ok = true;
@@ -199,6 +200,26 @@ int main() {
                 tmax.t = std::numeric_limits<i32>::max();
                 expect(!save_gpt(tmaxsave.string(), gmax, tok, &tmax),
                        "save_gpt rejects t=INT32_MAX");
+            }
+
+            // A terminal counter is storable, but an explicit resume must not
+            // silently start an epoch whose step() can no longer advance it.
+            {
+                GPT gnear(cfg.vocab, cfg.dim, cfg.blocks, cfg.max_len);
+                auto gp = gnear.params();
+                for (size_t i = 0; i < gp.size(); ++i) gp[i]->data = weights[i].data;
+                GPTResume nearp = res;
+                nearp.t = std::numeric_limits<i32>::max() - 1;
+                expect(save_gpt(nearmax.string(), gnear, tok, &nearp),
+                       "save_gpt stores terminal t=INT32_MAX-1");
+
+                GPTConfig cn{}; Tokenizer tn; std::vector<Tensor> wn;
+                GPTResume rn;
+                expect(read_gpt_checkpoint(nearmax.string(), cn, tn, wn),
+                       "terminal checkpoint readable for inference");
+                expect(!read_gpt_checkpoint(nearmax.string(), cn, tn, wn,
+                                            Tokenizer::MAX_BYTES, &rn),
+                       "explicit resume rejects terminal t");
             }
 
             // ---- 4. sensitivity: zeroing m/v must change the continuation ----
@@ -373,7 +394,7 @@ int main() {
 
     for (const auto& p : { data, full, part, bad, v2, zero, noopt, complete, missing,
                            twoonly, spaced, spaced_data, other_data, changed,
-                           shortened, arch, maxcalls, tmaxsave })
+                           shortened, arch, maxcalls, tmaxsave, nearmax })
         fs::remove(p);
     if (!ok) { std::fprintf(stderr, "gpt_resume_checks: FAILED\n"); return 1; }
     std::puts("gpt_resume_checks: OK");

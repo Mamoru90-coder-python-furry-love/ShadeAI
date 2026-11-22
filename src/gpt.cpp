@@ -680,6 +680,9 @@ bool read_gpt_checkpoint(const std::string& path, GPTConfig& cfg,
                 if ((i32)parsed_resume.v.size() != n || used != expected_params) return false;
                 i32 rt = 0;
                 if (!read_i32(f, rt) || !adamw_t_valid(rt)) return false;
+                // A terminal counter is still readable for inference, but an
+                // explicit resume could never take another savable step.
+                if (resume && !adamw_t_can_step(rt)) return false;
                 parsed_resume.t = rt;
                 for (const auto& t : parsed_resume.m)
                     if (Serialize::has_naninf_tensor(t)) return false;
